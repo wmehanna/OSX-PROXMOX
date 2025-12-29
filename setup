@@ -313,10 +313,11 @@ check_proxmox_version() {
     log_and_exit "Unsupported Proxmox version. Use 7.x, 8.x, or 9.x" "$log_file"
   fi
 
-  # Warn about preliminary Proxmox 9 support
+  # Proxmox 9 is fully supported with workarounds for QEMU 10.x changes
   if [[ "$version" == pve-manager/9.* ]]; then
-    display_and_log "Proxmox 9 is in preliminary testing. Use at your own risk." "$log_file"
-    sleep 5
+    display_and_log "✓ Proxmox 9.x detected - Using enhanced compatibility mode for QEMU 10.x" "$log_file"
+    display_and_log "  Note: Script implements automatic workarounds for media parameter validation" "$log_file"
+    sleep 3
   fi
 }
 
@@ -414,9 +415,14 @@ create_vm() {
   fi
 
   # Check QEMU version and append hotplug fix if 6.1 or newer
+  # Required for Proxmox 8.4+ with QEMU 6.1+ / Proxmox 9.x with QEMU 10.x
+  # Machine version 6.1+ enables ACPI hotplug on PCI bridges by default, which breaks macOS
   local qemu_version=$(qemu-system-x86_64 --version | awk '/version/ {print $4}' | cut -d'(' -f1)
   version_compare "$qemu_version" "6.1" && device_args="$device_args -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
 
+  # Create VM with ISOs initially set as media=cdrom
+  # This is required because Proxmox 8.4+ enforces explicit media parameter validation
+  # and Proxmox 9.x with QEMU 10.x rejects media=disk for ISOs during VM creation
   qm create "$vm_id" \
     --agent 1 --args "$device_args $cpu_args" --autostart 0 \
     --balloon 0 --bios ovmf --boot "order=ide0;$disk_type" \
@@ -428,6 +434,11 @@ create_vm() {
     --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" \
     --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=96M" \
     --ide2 "${storage_iso}:iso/recovery-${version_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
+
+  # CRITICAL WORKAROUND for Proxmox 8.4+ and 9.x:
+  # Change media=cdrom to media=disk AFTER VM creation to bypass validation
+  # This allows OpenCore and macOS recovery ISOs to be treated as bootable disks
+  # Direct creation with media=disk fails in qm create but works when editing the config file
   sed -i 's/media=cdrom/media=disk/' "/etc/pve/qemu-server/$vm_id.conf" >>"$logfile" 2>&1 || log_and_exit "Failed to update VM config" "$logfile"
 
   display_and_log "VM ($vm_name) created successfully" "$logfile"

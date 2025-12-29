@@ -5,3 +5,5 @@
 ehthumbs.db
 Thumbs.db
 logs
+node_modules/
+.husky/
