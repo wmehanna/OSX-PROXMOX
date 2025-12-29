@@ -392,10 +392,23 @@ download_recovery_image() {
 create_vm() {
   local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10}
   local logfile="${LOGDIR}/crt-vm-${OSX_PLATFORM,,}-${version_name,,}.log"
+
+  # Verify OpenCore ISO exists
   iso_file="${OPENCORE_ISO}"
   if [ ! -f "${ISODIR}/$iso_file" ]; then
+    display_and_log "OpenCore ISO not found, creating it..." "$logfile"
     update_opencore_iso
   fi
+
+  # Critical: Verify both ISOs exist before proceeding
+  if [ ! -f "${ISODIR}/$iso_file" ]; then
+    log_and_exit "OpenCore ISO not found at ${ISODIR}/$iso_file" "$logfile"
+  fi
+  local recovery_iso="${ISODIR}/recovery-${version_name,,}.iso"
+  if [ ! -f "$recovery_iso" ]; then
+    log_and_exit "Recovery ISO not found at $recovery_iso" "$logfile"
+  fi
+
   [[ ! -d "/sys/class/net/$bridge" ]] && log_and_exit "Bridge $bridge does not exist" "$logfile"
 
   local cpu_args device_args='-device isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc" -smbios type=2'
@@ -1398,9 +1411,30 @@ configure_macos_vm() {
     fi
   done
 
-  # Recovery Image
-  read -rp "Download recovery image? [Y/n]: " CRTRECODISK
-  [[ "${CRTRECODISK:-Y}" =~ ^[Yy]$ ]] && download_recovery_image "$version_name" "$board_id" "$model_id" "$iso_size"
+  # Recovery Image - always required for VM creation
+  local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
+  if [[ ! -f "$iso_path" ]]; then
+    read -rp "Recovery image not found. Download now? [Y/n]: " CRTRECODISK
+    if [[ "${CRTRECODISK:-Y}" =~ ^[Yy]$ ]]; then
+      download_recovery_image "$version_name" "$board_id" "$model_id" "$iso_size"
+    else
+      display_and_log "ERROR: Cannot create VM without recovery image"
+      display_and_log "Recovery ISO required at: $iso_path"
+      read -n 1 -sp "Press any key to return to menu..."
+      return
+    fi
+  else
+    display_and_log "Using existing recovery image: $iso_path"
+  fi
+
+  # Verify recovery ISO exists before creating VM
+  if [[ ! -f "$iso_path" ]]; then
+    display_and_log "ERROR: Recovery image not found at $iso_path"
+    display_and_log "VM creation aborted"
+    read -n 1 -sp "Press any key to return to menu..."
+    return
+  fi
+
   create_vm "$version_name" "$VM_ID" "$VM_NAME" "$SIZEDISK" "$STORAGECRTVM" "$PROC_COUNT" "$RAM_SIZE" "$iso_size" "$disk_type" "$BRIDGECRTVM"
   read -n 1 -sp "Press any key to return to menu..."
 }
