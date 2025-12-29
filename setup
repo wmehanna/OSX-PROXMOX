@@ -105,6 +105,49 @@ next_power_of_2() {
   echo $p
 }
 
+# Interactive menu selection with arrow keys
+# Returns: selected value via stdout, return code 0 for selection, 1 for custom input
+select_from_menu() {
+  local prompt="$1"
+  local default_idx="${2:-0}"
+  shift 2
+  local options=("$@")
+  local selected=$default_idx
+  local key
+
+  while true; do
+    echo "$prompt"
+    echo
+    for i in "${!options[@]}"; do
+      if [ $i -eq $selected ]; then
+        echo "  > ${options[$i]}"
+      else
+      echo "    ${options[$i]}"
+      fi
+    done
+    echo
+    echo "Use ↑/↓ arrows, ENTER to select, 'c' to type custom"
+
+    read -rsn1 key
+    case "$key" in
+      $'\x1b')
+        read -rsn2 key
+        case "$key" in
+          '[A') ((selected > 0)) && ((selected--)) ;;
+          '[B') ((selected < ${#options[@]} - 1)) && ((selected++)) ;;
+        esac
+        ;;
+      '')
+        echo "${options[$selected]}"
+        return 0
+        ;;
+      'c'|'C')
+        return 1
+        ;;
+    esac
+  done
+}
+
 # Function to log errors and exit
 log_and_exit() {
   local message=$1
@@ -1278,21 +1321,33 @@ configure_macos_vm() {
     fi
   done
 
-  # Disk Size
+  # Disk Size - interactive menu
   default_disk_size=$((BASE_DISK_SIZE + (opt > 6 ? 2 : opt == 4 ? 1 : 0) * DISK_INCREMENT))
-  while true; do
-    read -rp "Disk size (GB) [default: $default_disk_size]: " SIZEDISK
-    SIZEDISK=${SIZEDISK:-$default_disk_size}
-    if [[ "$SIZEDISK" =~ ^[0-9]+$ ]]; then
-      break
-    else
-      display_and_log "Disk size must be an integer. Please try again."
-    fi
-  done
+  local disk_options=("64 GB" "128 GB (recommended)" "256 GB" "512 GB" "1024 GB (1 TB)")
+  local disk_default_idx=1
+  [[ $default_disk_size -eq 64 ]] && disk_default_idx=0
+  [[ $default_disk_size -eq 128 ]] && disk_default_idx=1
+  [[ $default_disk_size -eq 256 ]] && disk_default_idx=2
+  [[ $default_disk_size -eq 512 ]] && disk_default_idx=3
+  [[ $default_disk_size -eq 1024 ]] && disk_default_idx=4
 
-  # Storage Selection
+  if result=$(select_from_menu "Select disk size:" $disk_default_idx "${disk_options[@]}"); then
+    SIZEDISK=$(echo "$result" | awk '{print $1}')
+  else
+    while true; do
+      read -rp "Enter disk size (GB) [default: $default_disk_size]: " SIZEDISK
+      SIZEDISK=${SIZEDISK:-$default_disk_size}
+      if [[ "$SIZEDISK" =~ ^[0-9]+$ ]]; then
+        break
+      else
+        display_and_log "Disk size must be an integer. Please try again."
+      fi
+    done
+  fi
+
+  # Storage Selection - interactive menu
   local storage_output=$(get_available_storages) || { display_and_log "Failed to retrieve storages"; read -n 1 -s; return 1; }
-  local storages=() default_storage=""
+  local storages=() default_storage="" storage_options=()
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     [[ -z "$default_storage" && ! "$line" =~ \| ]] && default_storage="$line" || storages+=("$line")
@@ -1304,34 +1359,38 @@ configure_macos_vm() {
     STORAGECRTVM="${storages[0]%%|*}"
     display_and_log "Using storage: $STORAGECRTVM"
   else
-    while true; do
-      display_and_log "Available storages:"
-      for s in "${storages[@]}"; do
-        storage_name="${s%%|*}"
-        avail_space="${s##*|}"
-        display_and_log "  - $storage_name ($avail_space GB)"
-      done
-      read -rp "Storage [${default_storage}]: " STORAGECRTVM
-      STORAGECRTVM=${STORAGECRTVM:-$default_storage}
-      local valid=false
-      for s in "${storages[@]}"; do
-        if [[ "$STORAGECRTVM" == "${s%%|*}" ]]; then
-          valid=true
+    for s in "${storages[@]}"; do
+      storage_name="${s%%|*}"
+      avail_space="${s##*|}"
+      storage_options+=("$storage_name ($avail_space GB free)")
+    done
+
+    if result=$(select_from_menu "Select storage:" 0 "${storage_options[@]}"); then
+      STORAGECRTVM=$(echo "$result" | awk '{print $1}')
+    else
+      while true; do
+        read -rp "Enter storage name [${default_storage}]: " STORAGECRTVM
+        STORAGECRTVM=${STORAGECRTVM:-$default_storage}
+        local valid=false
+        for s in "${storages[@]}"; do
+          if [[ "$STORAGECRTVM" == "${s%%|*}" ]]; then
+            valid=true
+            break
+          fi
+        done
+        if $valid; then
+          display_and_log "Selected storage: $STORAGECRTVM"
           break
+        else
+          display_and_log "Invalid storage. Please try again."
         fi
       done
-      if $valid; then
-        display_and_log "Selected storage: $STORAGECRTVM"
-        break
-      else
-        display_and_log "Invalid storage. Please try again."
-      fi
-    done
+    fi
   fi
 
-  # Bridge Selection
+  # Bridge Selection - interactive menu
   local bridge_output=$(get_available_bridges) || { display_and_log "Failed to retrieve bridges"; read -n 1 -s; return 1; }
-  local bridges=() default_bridge=""
+  local bridges=() default_bridge="" bridge_options=()
   while IFS= read -r line; do
     line=$(echo "$line" | tr -d '\r')
     [[ -z "$line" ]] && continue
@@ -1348,7 +1407,7 @@ configure_macos_vm() {
   declare -A bridge_info
   for b in "${bridges[@]}"; do
     IFS='|' read -r bridge_name ip_addr <<< "$b"
-    bridge_info["$bridge_name"]="IP address: ${ip_addr:-unknown}"
+    bridge_info["$bridge_name"]="IP: ${ip_addr:-unknown}"
   done
 
   mapfile -t sorted_names < <(printf '%s\n' "${!bridge_info[@]}" | sort -V)
@@ -1360,56 +1419,75 @@ configure_macos_vm() {
     BRIDGECRTVM="$name"
     display_and_log "Using bridge: $BRIDGECRTVM ($ip_info)"
   else
-    while true; do
-      display_and_log "Available bridges:"
-      for name in "${sorted_names[@]}"; do
-        bridge_num=${name#vmbr}
-        ip_info="${bridge_info[$name]}"
-        display_and_log "  - $bridge_num ($name, $ip_info)"
-      done
-      read -rp "Bridge number [${default_bridge_num}]: " BRIDGE_NUM
-      BRIDGE_NUM=${BRIDGE_NUM:-$default_bridge_num}
-      if [[ "$BRIDGE_NUM" =~ ^[0-9]+$ ]]; then
-        BRIDGECRTVM="vmbr$BRIDGE_NUM"
-        if [[ -v bridge_info[$BRIDGECRTVM] ]]; then
-          display_and_log "Selected bridge: $BRIDGECRTVM"
-          break
+    for name in "${sorted_names[@]}"; do
+      ip_info="${bridge_info[$name]}"
+      bridge_options+=("$name ($ip_info)")
+    done
+
+    if result=$(select_from_menu "Select network bridge:" 0 "${bridge_options[@]}"); then
+      BRIDGECRTVM=$(echo "$result" | awk '{print $1}')
+    else
+      while true; do
+        read -rp "Enter bridge number [${default_bridge_num}]: " BRIDGE_NUM
+        BRIDGE_NUM=${BRIDGE_NUM:-$default_bridge_num}
+        if [[ "$BRIDGE_NUM" =~ ^[0-9]+$ ]]; then
+          BRIDGECRTVM="vmbr$BRIDGE_NUM"
+          if [[ -n "${bridge_info[$BRIDGECRTVM]}" ]]; then
+            display_and_log "Selected bridge: $BRIDGECRTVM"
+            break
+          else
+            display_and_log "Invalid bridge number. Please try again."
+          fi
         else
-          display_and_log "Invalid bridge number. Please try again."
+          display_and_log "Bridge number must be an integer. Please try again."
         fi
+      done
+    fi
+  fi
+
+  # CPU Cores - interactive menu
+  local cpu_options=("2 cores" "4 cores (recommended)" "8 cores" "16 cores")
+  if result=$(select_from_menu "Select CPU cores:" 1 "${cpu_options[@]}"); then
+    PROC_COUNT=$(echo "$result" | awk '{print $1}')
+  else
+    while true; do
+      read -rp "Enter CPU cores (power of 2): " PROC_COUNT
+      if [[ "$PROC_COUNT" =~ ^[0-9]+$ ]]; then
+        if ! is_power_of_2 "$PROC_COUNT"; then
+          PROC_COUNT=$(next_power_of_2 "$PROC_COUNT")
+          display_and_log "Adjusted to next power of 2: $PROC_COUNT"
+        fi
+        break
       else
-        display_and_log "Bridge number must be an integer. Please try again."
+        display_and_log "CPU cores must be an integer. Please try again."
       fi
     done
   fi
-
-  # CPU Cores
-  while true; do
-    read -rp "CPU cores (power of 2) [4]: " PROC_COUNT
-    PROC_COUNT=${PROC_COUNT:-4}
-    if [[ "$PROC_COUNT" =~ ^[0-9]+$ ]]; then
-      if ! is_power_of_2 "$PROC_COUNT"; then
-        PROC_COUNT=$(next_power_of_2 "$PROC_COUNT")
-        display_and_log "Adjusted to next power of 2: $PROC_COUNT"
-      fi
-      break
-    else
-      display_and_log "CPU cores must be an integer. Please try again."
-    fi
-  done
   ((PROC_COUNT > MAX_CORES)) && PROC_COUNT=$MAX_CORES
 
-  # RAM
-  while true; do
-    default_ram=$((BASE_RAM_SIZE + PROC_COUNT * RAM_PER_CORE))
-    read -rp "RAM (MiB) [$default_ram]: " RAM_SIZE
-    RAM_SIZE=${RAM_SIZE:-$default_ram}
-    if [[ "$RAM_SIZE" =~ ^[0-9]+$ ]]; then
-      break
-    else
-      display_and_log "RAM must be an integer. Please try again."
-    fi
-  done
+  # RAM - interactive menu
+  local default_ram=$((BASE_RAM_SIZE + PROC_COUNT * RAM_PER_CORE))
+  local ram_options=("4096 MiB (4 GB)" "6144 MiB (6 GB - recommended)" "8192 MiB (8 GB)" "16384 MiB (16 GB)" "32768 MiB (32 GB)")
+  local ram_default_idx=1
+  [[ $default_ram -eq 4096 ]] && ram_default_idx=0
+  [[ $default_ram -eq 6144 ]] && ram_default_idx=1
+  [[ $default_ram -eq 8192 ]] && ram_default_idx=2
+  [[ $default_ram -eq 16384 ]] && ram_default_idx=3
+  [[ $default_ram -eq 32768 ]] && ram_default_idx=4
+
+  if result=$(select_from_menu "Select RAM:" $ram_default_idx "${ram_options[@]}"); then
+    RAM_SIZE=$(echo "$result" | awk '{print $1}')
+  else
+    while true; do
+      read -rp "Enter RAM (MiB) [$default_ram]: " RAM_SIZE
+      RAM_SIZE=${RAM_SIZE:-$default_ram}
+      if [[ "$RAM_SIZE" =~ ^[0-9]+$ ]]; then
+        break
+      else
+        display_and_log "RAM must be an integer. Please try again."
+      fi
+    done
+  fi
 
   # Recovery Image - always required for VM creation
   local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
