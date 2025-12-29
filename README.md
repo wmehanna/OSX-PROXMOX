@@ -25,6 +25,11 @@ Run macOS on Proxmox VE (AMD & Intel) with automatic version detection and compa
 
 ## What's New
 
+### Latest Updates (December 2024)
+- **Interactive Menu Navigation** - Arrow key selection for all VM options (CPU/RAM/Disk/Storage/Bridge)
+- **Security Hardening** - Fixed 5 critical vulnerabilities (command injection, path traversal, network timeouts)
+- **Better Error Handling** - ISO validation prevents broken VMs, automatic rollback on failures
+
 ### Proxmox 9.x Full Support
 - Automatic QEMU 10.x compatibility - script handles all breaking changes
 - Media parameter workarounds - bypasses strict ISO validation
@@ -35,8 +40,9 @@ Run macOS on Proxmox VE (AMD & Intel) with automatic version detection and compa
 Original tutorials for Proxmox 8.4 don't work on 9.x. This version:
 - Auto-detects Proxmox version and applies appropriate fixes
 - Works on Proxmox 7.x, 8.x, and 9.x
+- Interactive menus instead of manual typing
+- Security hardened against injection attacks
 - Comprehensive documentation explaining what and why
-- Updated installation commands
 
 ---
 
