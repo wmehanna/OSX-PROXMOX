@@ -50,6 +50,14 @@ NETWORK_INTERFACES_FILE="/etc/network/interfaces"
 DHCP_USER="dhcpd"
 OPENCORE_ISO="opencore-osx-proxmox-vm.iso"
 
+# TUI Colors
+COLOR_RESET="\033[0m"
+COLOR_GREEN="\033[1;32m"
+COLOR_CYAN="\033[1;36m"
+COLOR_YELLOW="\033[1;33m"
+COLOR_RED="\033[1;31m"
+COLOR_SELECTED="\033[1;32m"
+
 # macOS version configuration
 declare -A MACOS_CONFIG=(
   ["1"]="High Sierra|10.13|Mac-BE088AF8C5EB4FA2|00000000000J80300|800M|sata0"
@@ -130,17 +138,18 @@ select_from_menu() {
   local key
 
   while true; do
-    echo "$prompt"
+    clear
+    echo -e "${COLOR_CYAN}$prompt${COLOR_RESET}"
     echo
     for i in "${!options[@]}"; do
       if [ $i -eq $selected ]; then
-        echo "  > ${options[$i]}"
+        echo -e "  ${COLOR_SELECTED}▶ ${options[$i]}${COLOR_RESET}"
       else
       echo "    ${options[$i]}"
       fi
     done
     echo
-    echo "Use ↑/↓ arrows, ENTER to select, 'c' to type custom"
+    echo -e "${COLOR_YELLOW}Use ↑/↓ arrows, ENTER to select, 'c' to type custom${COLOR_RESET}"
 
     read -rsn1 key
     case "$key" in
@@ -168,6 +177,13 @@ log_and_exit() {
   local logfile=$2
   display_and_log "$message" "$logfile"
   exit 1
+}
+
+# Function to pause and return to menu
+pause_for_menu_return() {
+  echo
+  echo -e "${COLOR_YELLOW}Press any key to return to menu...${COLOR_RESET}"
+  read -n 1 -s
 }
 
 # Function to validate VM name
@@ -269,7 +285,7 @@ ensure_xmlstarlet_dependency() {
 
 # Function to ensure base64 and xxd are available
 ensure_base64_xxd_dependency() {
-  local logfile="${LOGDIR}/base64-xxd-dependency.log"
+  local logfile="${1:-${LOGDIR}/base64-xxd-dependency.log}"
   if ! command -v base64 >/dev/null || ! command -v xxd >/dev/null; then
     display_and_log "Installing base64 and xxd..." "$logfile"
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
@@ -364,10 +380,11 @@ init_dirs() {
 check_proxmox_version() {
   local log_file="${LOGDIR}/proxmox-version.log"
 
-  # Check supported Proxmox versions
+  # Check supported Proxmox versions (7.x, 8.x, 9.x, 10.x+)
   local version=$(pveversion | grep -oE "pve-manager/[0-9.]+")
-  if [[ "$version" != pve-manager/[7-9].* ]]; then
-    log_and_exit "Unsupported Proxmox version. Use 7.x, 8.x, or 9.x" "$log_file"
+  local major_version=$(echo "$version" | grep -oE "[0-9]+" | head -1)
+  if [[ -n "$major_version" && "$major_version" -lt 7 ]]; then
+    log_and_exit "Unsupported Proxmox version. Requires 7.x or newer" "$log_file"
   fi
 
   # Proxmox 9 is fully supported with workarounds for QEMU 10.x changes
@@ -539,6 +556,7 @@ create_vm() {
   # Clean up backup on success
   rm -f "${vm_conf}.backup-"* 2>/dev/null
 
+  echo -e "${COLOR_GREEN}✓ VM ($vm_name) created successfully${COLOR_RESET}"
   display_and_log "VM ($vm_name) created successfully" "$logfile"
   local bridge_ip=$(ip -4 addr show "$bridge" | awk '/inet/ {print $2}' | cut -d'/' -f1 || echo "unknown")
   if [[ "$version_name" =~ "High Sierra" ]]; then
@@ -561,7 +579,7 @@ add_no_subscription_repo() {
   fi
   apt update -y >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   display_and_log "Repository added successfully" "$logfile"
-  read -n 1 -sp "Press any key to return to menu..."
+  pause_for_menu_return
 }
 
 # Cleaned function to update the SMBIOS in the OpenCore ISO
@@ -960,7 +978,7 @@ customize_opencore_config() {
   umount /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to unmount ISO" "$logfile"
   losetup -d "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to detach loop device" "$logfile"
   display_and_log "OpenCore config customized" "$logfile"
-  read -n 1 -sp "Press any key to return to menu..."
+  pause_for_menu_return
 }
 
 # Function to update OpenCore ISO
@@ -1002,7 +1020,7 @@ clear_recovery_images() {
     find "$LOGDIR" -type f -name "crt-recovery-*.log" -delete 2>/dev/null
   fi
   display_and_log "All recovery images cleared"
-  read -n 1 -sp "Press any key to return to menu..."
+  pause_for_menu_return
 }
 
 # Function to remove subscription notice
@@ -1010,7 +1028,7 @@ remove_subscription_notice() {
   echo "DPkg::Post-Invoke { \"if [ -s /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && ! grep -q -F 'NoMoreNagging' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; then echo 'Removing subscription nag from UI...'; sed -i '/data\.status/{s/\!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; fi\" };" >/etc/apt/apt.conf.d/no-nag-script
   apt --reinstall install proxmox-widget-toolkit &>/dev/null
   display_and_log "Subscription notice removed"
-  read -n 1 -sp "Press any key to return to menu..."
+  pause_for_menu_return
 }
 
 # Function to configure network bridge
@@ -1019,6 +1037,7 @@ configure_network_bridge() {
 
   # Logging functions
   die() {
+    echo -e "${COLOR_RED}✗ ERROR: $*${COLOR_RESET}"
     display_and_log "ERROR: $*" "$logfile"
     exit 1
   }
@@ -1565,25 +1584,28 @@ configure_macos_vm() {
     if [[ "${CRTRECODISK:-Y}" =~ ^[Yy]$ ]]; then
       download_recovery_image "$version_name" "$board_id" "$model_id" "$iso_size"
     else
+      echo -e "${COLOR_RED}✗ ERROR: Cannot create VM without recovery image${COLOR_RESET}"
       display_and_log "ERROR: Cannot create VM without recovery image"
       display_and_log "Recovery ISO required at: $iso_path"
-      read -n 1 -sp "Press any key to return to menu..."
+      pause_for_menu_return
       return
     fi
   else
+    echo -e "${COLOR_GREEN}✓ Using existing recovery image${COLOR_RESET}"
     display_and_log "Using existing recovery image: $iso_path"
   fi
 
   # Verify recovery ISO exists before creating VM
   if [[ ! -f "$iso_path" ]]; then
+    echo -e "${COLOR_RED}✗ ERROR: Recovery image not found at $iso_path${COLOR_RESET}"
     display_and_log "ERROR: Recovery image not found at $iso_path"
     display_and_log "VM creation aborted"
-    read -n 1 -sp "Press any key to return to menu..."
+    pause_for_menu_return
     return
   fi
 
   create_vm "$version_name" "$VM_ID" "$VM_NAME" "$SIZEDISK" "$STORAGECRTVM" "$PROC_COUNT" "$RAM_SIZE" "$iso_size" "$disk_type" "$BRIDGECRTVM"
-  read -n 1 -sp "Press any key to return to menu..."
+  pause_for_menu_return
 }
 
 # Function for main menu loop
@@ -1591,12 +1613,12 @@ main_menu() {
   while true; do
     clear
     NEXTID=$(pvesh get /cluster/nextid)
-    echo "═══════════════════════════════════════════════════════"
-    echo "            O S X - P R O X M O X                      "
-    echo "        Full Proxmox 9.x Support with QEMU 10.x        "
-    echo "═══════════════════════════════════════════════════════"
+    echo -e "${COLOR_CYAN}═══════════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}            O S X - P R O X M O X                      ${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}        Full Proxmox 9.x Support with QEMU 10.x        ${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}═══════════════════════════════════════════════════════${COLOR_RESET}"
     echo
-    echo "Next VM ID: ${NEXTID} │ OpenCore: ${OCVERSION} │ Version: ${HACKPXVERSION}"
+    echo -e "${COLOR_YELLOW}Next VM ID: ${NEXTID} │ OpenCore: ${OCVERSION} │ Version: ${HACKPXVERSION}${COLOR_RESET}"
     echo
 
     # Build menu options arrays
