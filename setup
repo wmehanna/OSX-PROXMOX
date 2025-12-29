@@ -76,16 +76,30 @@ display_and_log() {
 # Cleanup function for mounts and temp files
 cleanup() {
   local logfile="${LOGDIR}/cleanup.log"
+
+  # Safely unmount APPLE mount point
   if mountpoint -q /mnt/APPLE 2>/dev/null; then
     umount /mnt/APPLE >>"$logfile" 2>&1 || display_and_log "Failed to unmount /mnt/APPLE" "$logfile"
     rmdir /mnt/APPLE 2>/dev/null
   fi
+
+  # Safely unmount opencore mount point
   if mountpoint -q /mnt/opencore 2>/dev/null; then
     umount /mnt/opencore >>"$logfile" 2>&1 || display_and_log "Failed to unmount /mnt/opencore" "$logfile"
     rmdir /mnt/opencore 2>/dev/null
   fi
-  losetup -a | grep -q "$TMPDIR" && losetup -d $(losetup -j "$TMPDIR"/* | awk -F: '{print $1}') >>"$logfile" 2>&1
-  rm -rf "${TMPDIR:?}"/* 2>/dev/null
+
+  # Safely detach loop devices - fixed command injection vulnerability
+  if [[ -n "$TMPDIR" ]] && losetup -a | grep -qF "$TMPDIR"; then
+    while IFS=: read -r loop_device _; do
+      [[ -n "$loop_device" ]] && losetup -d "$loop_device" >>"$logfile" 2>&1 || true
+    done < <(losetup -j "$TMPDIR"/* 2>/dev/null)
+  fi
+
+  # Safely remove temp files - validate path before deletion
+  if [[ -d "$TMPDIR" && -n "$TMPDIR" && "$TMPDIR" != "/" && "$TMPDIR" =~ ^/root/OSX-PROXMOX/tmp ]]; then
+    find "$TMPDIR" -mindepth 1 -delete 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -378,7 +392,11 @@ setup_prerequisites() {
   printf "set mouse-=a\n" > ~/.vimrc
   rm -f /etc/apt/sources.list.d/pve-enterprise.list
   apt-get update >>"$logfile" 2>&1 || {
-    local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
+    # Fetch country code with timeout and validation
+    local country
+    country=$(curl -sS --max-time 5 --max-filesize 10 https://ipinfo.io/country 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    # Validate country code format (2-letter lowercase)
+    [[ ! "$country" =~ ^[a-z]{2}$ ]] && country="us"
     sed -i "s/ftp.$country.debian.org/ftp.debian.org/g" /etc/apt/sources.list
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   }
@@ -421,6 +439,12 @@ download_recovery_image() {
   mkdir -p /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
   mount "$loopdev" /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to mount image" "$logfile"
   cd /mnt/APPLE
+
+  # Validate board_id and model_id to prevent command injection
+  if [[ ! "$board_id" =~ ^[a-zA-Z0-9_-]+$ || ! "$model_id" =~ ^[a-zA-Z0-9]+$ ]]; then
+    log_and_exit "Invalid board_id or model_id format" "$logfile"
+  fi
+
   local recovery_args="-b $board_id -m $model_id download"
   [[ "$version_name" == "Sequoia" ]] && recovery_args="$recovery_args -os latest"
   python3 "${SCRIPT_DIR}/tools/macrecovery/macrecovery.py" $recovery_args >>"$logfile" 2>&1 || log_and_exit "Failed to download recovery" "$logfile"
@@ -495,7 +519,25 @@ create_vm() {
   # Change media=cdrom to media=disk AFTER VM creation to bypass validation
   # This allows OpenCore and macOS recovery ISOs to be treated as bootable disks
   # Direct creation with media=disk fails in qm create but works when editing the config file
-  sed -i 's/media=cdrom/media=disk/' "/etc/pve/qemu-server/$vm_id.conf" >>"$logfile" 2>&1 || log_and_exit "Failed to update VM config" "$logfile"
+
+  # Validate VM ID and config path before modification
+  local vm_conf="/etc/pve/qemu-server/${vm_id}.conf"
+  if [[ ! "$vm_id" =~ ^[0-9]+$ || ! -f "$vm_conf" ]]; then
+    log_and_exit "Invalid VM ID or config not found: $vm_id" "$logfile"
+  fi
+
+  # Create backup before modification
+  cp "$vm_conf" "${vm_conf}.backup-$(date +%s)" || log_and_exit "Failed to backup VM config" "$logfile"
+
+  # Apply workaround with rollback on failure
+  if ! sed -i 's/media=cdrom/media=disk/' "$vm_conf" >>"$logfile" 2>&1; then
+    # Restore from backup if sed fails
+    mv "${vm_conf}.backup-"* "$vm_conf" 2>/dev/null
+    log_and_exit "Failed to update VM config" "$logfile"
+  fi
+
+  # Clean up backup on success
+  rm -f "${vm_conf}.backup-"* 2>/dev/null
 
   display_and_log "VM ($vm_name) created successfully" "$logfile"
   local bridge_ip=$(ip -4 addr show "$bridge" | awk '/inet/ {print $2}' | cut -d'/' -f1 || echo "unknown")
@@ -538,6 +580,12 @@ update_opencore_smbios() {
         if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
           SystemProductName="$new_value"
         fi
+
+      # Validate SystemProductName to prevent command injection
+      if [[ ! "$SystemProductName" =~ ^[a-zA-Z0-9,._-]+$ ]]; then
+        log_and_exit "Invalid SystemProductName format: $SystemProductName (must be alphanumeric with , . _ -)" "$logfile"
+      fi
+
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     else
@@ -732,6 +780,12 @@ customize_opencore_config() {
       if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
         SystemProductName="$new_value"
       fi
+
+    # Validate SystemProductName to prevent command injection
+    if [[ ! "$SystemProductName" =~ ^[a-zA-Z0-9,._-]+$ ]]; then
+      log_and_exit "Invalid SystemProductName format: $SystemProductName (must be alphanumeric with , . _ -)" "$logfile"
+    fi
+
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     # Apply new JSON
@@ -917,10 +971,20 @@ update_opencore_iso() {
   iso_path="${ISODIR}/${OPENCORE_ISO}"
   oc_json_path="${ISODIR}/.smbios.json"
 
-  rm -f "$iso_path" >>"$logfile" 2>&1
-  if ! wget -q -O "$iso_path" "$iso_url" >>"$logfile" 2>&1; then
-    log_and_exit "Failed to download OpenCore ISO" "$logfile"
+  # Safe removal with path validation
+  if [[ -f "$iso_path" && "$iso_path" =~ ^/.+/[^/]+\.iso$ ]]; then
+    rm -f "$iso_path" >>"$logfile" 2>&1
   fi
+
+  # Download with timeout and to temp file first
+  local tmp_iso="${iso_path}.tmp"
+  if ! wget -q --timeout=300 --tries=3 -O "$tmp_iso" "$iso_url" >>"$logfile" 2>&1; then
+    rm -f "$tmp_iso"
+    log_and_exit "Failed to download OpenCore ISO from $iso_url" "$logfile"
+  fi
+
+  # Atomically move temp file to final location
+  mv "$tmp_iso" "$iso_path" || log_and_exit "Failed to move OpenCore ISO to $iso_path" "$logfile"
   ensure_base64_xxd_dependency
   update_opencore_smbios "$iso_path" "$oc_json_path"
 
@@ -930,8 +994,13 @@ update_opencore_iso() {
 
 # Function to clear recovery images
 clear_recovery_images() {
-  find "$ISODIR" -type f -name "recovery-*.iso" -delete
-  find "$LOGDIR" -type f -name "crt-recovery-*.log" -delete
+  # Validate paths before deletion
+  if [[ -d "$ISODIR" && -n "$ISODIR" ]]; then
+    find "$ISODIR" -type f -name "recovery-*.iso" -delete 2>/dev/null
+  fi
+  if [[ -d "$LOGDIR" && -n "$LOGDIR" ]]; then
+    find "$LOGDIR" -type f -name "crt-recovery-*.log" -delete 2>/dev/null
+  fi
   display_and_log "All recovery images cleared"
   read -n 1 -sp "Press any key to return to menu..."
 }
