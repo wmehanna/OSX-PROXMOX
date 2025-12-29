@@ -1591,51 +1591,99 @@ main_menu() {
   while true; do
     clear
     NEXTID=$(pvesh get /cluster/nextid)
-    echo "#######################################################"
-    echo "################ O S X - P R O X M O X ################"
-    echo "############### https://osx-proxmox.com ###############"
-    echo "############### version: ${HACKPXVERSION} ###################"
-    echo "#######################################################"
+    echo "═══════════════════════════════════════════════════════"
+    echo "            O S X - P R O X M O X                      "
+    echo "        Full Proxmox 9.x Support with QEMU 10.x        "
+    echo "═══════════════════════════════════════════════════════"
     echo
-    echo " Next VM ID: ${NEXTID}"
-    echo " OpenCore version: ${OCVERSION}"
+    echo "Next VM ID: ${NEXTID} │ OpenCore: ${OCVERSION} │ Version: ${HACKPXVERSION}"
     echo
-    echo "Enter macOS version:"
-    # Sort MACOS_CONFIG by version number
+
+    # Build menu options arrays
+    local macos_options=()
+    local macos_keys=()
+
+    # Sort and build macOS version options
     for i in $(for key in "${!MACOS_CONFIG[@]}"; do
       IFS='|' read -r _ version _ _ _ _ <<< "${MACOS_CONFIG[$key]}"
       echo "$version|$key"
     done | sort -t'|' -k1,1V | cut -d'|' -f2); do
       IFS='|' read -r name version _ _ _ _ <<< "${MACOS_CONFIG[$i]}"
       [[ "$name" == "Sequoia" ]] && display_name="macOS Sequoia" || display_name="$name"
-      echo " $i - $display_name - $version"
+      macos_options+=("$display_name ($version)")
+      macos_keys+=("$i")
     done
-    echo
-    echo "Additional options:"
-    echo " 200 - Add Proxmox VE no-subscription repo"
-    echo " 201 - Update OpenCore ISO"
-    echo " 202 - Clear all macOS recovery images"
-    echo " 203 - Remove Proxmox subscription notice"
-    echo " 204 - Add new bridge (macOS in cloud)"
-    echo " 205 - Customize OpenCore config.plist"
-    echo
-    echo " 0 - Quit (or ENTER)"
-    echo
-    read -rp "Option: " OPT
-    [[ -z "$OPT" || "$OPT" -eq 0 ]] && exit
 
-    if [[ ${MACOS_CONFIG[$OPT]} ]]; then
-      configure_macos_vm "${MACOS_CONFIG[$OPT]}" "$NEXTID" "$OPT"
+    # Add additional options
+    macos_options+=(
+      "────────────────────────────────────"
+      "Add Proxmox no-subscription repo"
+      "Update OpenCore ISO"
+      "Clear macOS recovery images"
+      "Remove Proxmox subscription notice"
+      "Add network bridge"
+      "Customize OpenCore config"
+      "────────────────────────────────────"
+      "Quit"
+    )
+    macos_keys+=("separator" "200" "201" "202" "203" "204" "205" "separator2" "0")
+
+    # Show interactive menu
+    if result=$(select_from_menu "Select option:" 0 "${macos_options[@]}"); then
+      # Find index of selected option
+      local selected_idx=0
+      for idx in "${!macos_options[@]}"; do
+        if [[ "${macos_options[$idx]}" == "$result" ]]; then
+          selected_idx=$idx
+          break
+        fi
+      done
+
+      local selected_key="${macos_keys[$selected_idx]}"
+
+      # Handle selection
+      if [[ "$selected_key" == "separator" || "$selected_key" == "separator2" ]]; then
+        continue
+      elif [[ "$selected_key" == "0" ]]; then
+        exit 0
+      elif [[ ${MACOS_CONFIG[$selected_key]} ]]; then
+        configure_macos_vm "${MACOS_CONFIG[$selected_key]}" "$NEXTID" "$selected_key"
+      else
+        case $selected_key in
+          200) add_no_subscription_repo ;;
+          201) update_opencore_iso ;;
+          202) clear_recovery_images ;;
+          203) remove_subscription_notice ;;
+          204) configure_network_bridge ;;
+          205) customize_opencore_config ;;
+        esac
+      fi
     else
-      case $OPT in
-        200) add_no_subscription_repo ;;
-        201) update_opencore_iso ;;
-        202) clear_recovery_images ;;
-        203) remove_subscription_notice ;;
-        204) configure_network_bridge ;;
-        205) customize_opencore_config ;;
-        *) echo "Invalid option"; read -n 1 -s ;;
-      esac
+      # Manual input mode
+      echo
+      echo "Manual input mode:"
+      for i in "${!macos_keys[@]}"; do
+        local key="${macos_keys[$i]}"
+        [[ "$key" == "separator" || "$key" == "separator2" ]] && continue
+        echo " $key - ${macos_options[$i]}"
+      done
+      echo
+      read -rp "Option: " OPT
+      [[ -z "$OPT" || "$OPT" -eq 0 ]] && exit
+
+      if [[ ${MACOS_CONFIG[$OPT]} ]]; then
+        configure_macos_vm "${MACOS_CONFIG[$OPT]}" "$NEXTID" "$OPT"
+      else
+        case $OPT in
+          200) add_no_subscription_repo ;;
+          201) update_opencore_iso ;;
+          202) clear_recovery_images ;;
+          203) remove_subscription_notice ;;
+          204) configure_network_bridge ;;
+          205) customize_opencore_config ;;
+          *) echo "Invalid option"; read -n 1 -s ;;
+        esac
+      fi
     fi
   done
 }
