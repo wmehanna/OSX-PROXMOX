@@ -550,7 +550,9 @@ create_vm() {
   cp "$vm_conf" "${vm_conf}.backup-$(date +%s)" || log_and_exit "Failed to backup VM config" "$logfile"
 
   # Apply workaround with rollback on failure
-  if ! sed -i 's/media=cdrom/media=disk/' "$vm_conf" >>"$logfile" 2>&1; then
+  # CRITICAL: Only change ide0 (OpenCore) to media=disk, NOT ide2 (recovery ISO)
+  # Recovery ISO must stay as media=cdrom or UEFI will boot it instead of OpenCore
+  if ! sed -i '/^ide0:/s/media=cdrom/media=disk/' "$vm_conf" >>"$logfile" 2>&1; then
     # Restore from backup if sed fails
     mv "${vm_conf}.backup-"* "$vm_conf" 2>/dev/null
     log_and_exit "Failed to update VM config" "$logfile"
