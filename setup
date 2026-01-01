@@ -527,7 +527,7 @@ create_vm() {
     --agent 1 --args "$device_args $cpu_args" --autostart 0 \
     --balloon 0 --bios ovmf --boot "order=ide0;$disk_type" \
     --cores "$core_count" --description "Hackintosh VM - $version_name" \
-    --efidisk0 "${storage}:4" --machine q35 --memory "$ram_size" \
+    --efidisk0 "${storage}:1,efitype=4m,pre-enrolled-keys=0" --machine q35 --memory "$ram_size" \
     --name "$vm_name" --net0 "vmxnet3,bridge=$bridge" --numa 0 \
     --onboot 0 --ostype other --sockets 1 --start 0 --tablet 1 \
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
