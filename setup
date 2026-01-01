@@ -141,18 +141,18 @@ select_from_menu() {
   local key
 
   while true; do
-    clear
-    echo -e "${COLOR_CYAN}$prompt${COLOR_RESET}"
-    echo
+    clear >&2
+    echo -e "${COLOR_CYAN}$prompt${COLOR_RESET}" >&2
+    echo >&2
     for i in "${!options[@]}"; do
       if [ $i -eq $selected ]; then
-        echo -e "  ${COLOR_SELECTED}▶ ${options[$i]}${COLOR_RESET}"
+        echo -e "  ${COLOR_SELECTED}▶ ${options[$i]}${COLOR_RESET}" >&2
       else
-      echo "    ${options[$i]}"
+      echo "    ${options[$i]}" >&2
       fi
     done
-    echo
-    echo -e "${COLOR_YELLOW}Use ↑/↓ arrows, ENTER to select, 'c' to type custom${COLOR_RESET}"
+    echo >&2
+    echo -e "${COLOR_YELLOW}Use ↑/↓ arrows, ENTER to select, 'c' to type custom${COLOR_RESET}" >&2
 
     read -rsn1 key
     case "$key" in
