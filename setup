@@ -32,6 +32,9 @@
 # Exit on any error
 set -e
 
+# Set TERM if not set (for SSH sessions)
+export TERM="${TERM:-xterm}"
+
 # Constants
 SCRIPT_DIR="/root/OSX-PROXMOX"
 LOGDIR="${SCRIPT_DIR}/logs"
