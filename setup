@@ -29,8 +29,9 @@
 
 ################################################################################################################################################################################################
 
-# Exit on any error
-set -e
+# CRITICAL: set -e removed - conflicts with ERR trap in update_opencore_iso()
+# Script uses explicit error handling with || log_and_exit throughout
+# set -e would cause ERR trap to not fire for errors in subfunctions
 
 # Set TERM if not set (for SSH sessions)
 export TERM="${TERM:-xterm}"
@@ -369,17 +370,21 @@ set_isodir() {
 
   [[ -z "$canonical_path" ]] && log_and_exit "Cannot resolve canonical path for $storage_iso_path" "$logfile"
 
-  # SECURITY: Whitelist check - must be under common Proxmox storage paths
-  if [[ ! "$canonical_path" =~ ^/var/lib/vz/ ]] && \
-     [[ ! "$canonical_path" =~ ^/mnt/ ]] && \
-     [[ ! "$canonical_path" =~ ^/srv/ ]]; then
-    log_and_exit "SECURITY: Storage path outside allowed directories: $canonical_path" "$logfile"
-  fi
-
-  # SECURITY: Block system-critical paths
+  # SECURITY: Validate path against whitelist AND blacklist
+  # First: Check blacklist (system-critical paths that must NEVER be used)
   case "$canonical_path" in
-    /|/etc|/etc/*|/root|/root/*|/usr|/usr/*|/var|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*)
+    /|/etc|/etc/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/var/tmp|/var/tmp/*)
       log_and_exit "SECURITY: Storage cannot be in system directory: $canonical_path" "$logfile"
+      ;;
+  esac
+
+  # Second: Check whitelist (only allow known Proxmox storage paths)
+  case "$canonical_path" in
+    /var/lib/vz/*|/mnt/*|/srv/*)
+      # Allowed - continue
+      ;;
+    *)
+      log_and_exit "SECURITY: Storage path outside allowed directories: $canonical_path" "$logfile"
       ;;
   esac
 
@@ -1182,7 +1187,7 @@ update_opencore_iso() {
 
   # Verify download completed (minimum size check prevents corrupted/partial downloads)
   local file_size
-  file_size=$(stat -c%s "$tmp_iso_gz" 2>/dev/null || echo 0)
+  file_size=$(wc -c < "$tmp_iso_gz" 2>/dev/null | tr -d ' ' || echo 0)
   if [ "$file_size" -lt 1000000 ]; then  # OpenCore v21.iso.gz should be ~12-15MB
     rm -f "$tmp_iso_gz"
     log_and_exit "Downloaded ISO too small (${file_size} bytes) - likely corrupted or incomplete" "$logfile"
@@ -1202,7 +1207,7 @@ update_opencore_iso() {
   fi
 
   local decompressed_size
-  decompressed_size=$(stat -c%s "$tmp_iso" 2>/dev/null || echo 0)
+  decompressed_size=$(wc -c < "$tmp_iso" 2>/dev/null | tr -d ' ' || echo 0)
   if [ "$decompressed_size" -lt 10000000 ]; then  # Should be ~100-150MB decompressed
     rm -f "$tmp_iso"
     log_and_exit "Decompressed ISO too small (${decompressed_size} bytes) - corrupted" "$logfile"
