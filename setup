@@ -51,7 +51,7 @@ MAX_CORES=16
 DHCP_CONF_DIR="/etc/dhcp/dhcpd.d"
 NETWORK_INTERFACES_FILE="/etc/network/interfaces"
 DHCP_USER="dhcpd"
-OPENCORE_ISO="opencore-osx-proxmox-vm.iso"
+OPENCORE_ISO="OpenCore-v21.iso"
 
 # TUI Colors
 COLOR_RESET="\033[0m"
@@ -504,11 +504,15 @@ create_vm() {
   else
     device_args="$device_args -device usb-kbd,bus=ehci.0,port=2 -device usb-mouse,bus=ehci.0,port=3"
   fi
+  # CRITICAL: CPU vendor string must match host CPU architecture
+  # AMD hosts: vendor=AuthenticAMD
+  # Intel hosts: vendor=GenuineIntel
+  # Mismatch causes macOS boot failures and kernel panics
   if [[ "$OSX_PLATFORM" == "AMD" ]]; then
     if [[ "$version_name" =~ ^(Ventura|Sonoma|Sequoia)$ ]]; then
-      cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
+      cpu_args="-cpu Cascadelake-Server,vendor=AuthenticAMD,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
     else
-      cpu_args="-cpu Penryn,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
+      cpu_args="-cpu Penryn,kvm=on,vendor=AuthenticAMD,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
     fi
   else
     cpu_args="-cpu host,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc"
@@ -1002,7 +1006,9 @@ customize_opencore_config() {
 update_opencore_iso() {
   local iso_path
   local logfile="${LOGDIR}/update-opencore-iso.log"
-  local iso_url="https://github.com/luchina-gabriel/OSX-PROXMOX/raw/main/EFI/opencore-osx-proxmox-vm.iso"
+  # CRITICAL: Use thenickdude's KVM-Opencore for Proxmox 9.x / QEMU 10.x compatibility
+  # Generic OpenCore fails with "LoadImage failed - Unsupported" on QEMU 10.x
+  local iso_url="https://github.com/thenickdude/KVM-Opencore/releases/download/v21/OpenCore-v21.iso.gz"
   iso_path="${ISODIR}/${OPENCORE_ISO}"
   oc_json_path="${ISODIR}/.smbios.json"
 
@@ -1011,15 +1017,23 @@ update_opencore_iso() {
     rm -f "$iso_path" >>"$logfile" 2>&1
   fi
 
-  # Download with timeout and to temp file first
-  local tmp_iso="${iso_path}.tmp"
-  if ! wget -q --timeout=300 --tries=3 -O "$tmp_iso" "$iso_url" >>"$logfile" 2>&1; then
-    rm -f "$tmp_iso"
+  # Download compressed ISO with timeout and to temp file first
+  local tmp_iso_gz="${iso_path}.tmp.gz"
+  if ! wget -q --timeout=300 --tries=3 -O "$tmp_iso_gz" "$iso_url" >>"$logfile" 2>&1; then
+    rm -f "$tmp_iso_gz"
     log_and_exit "Failed to download OpenCore ISO from $iso_url" "$logfile"
   fi
 
-  # Atomically move temp file to final location
+  # Decompress the .gz file
+  if ! gunzip -f "$tmp_iso_gz" >>"$logfile" 2>&1; then
+    rm -f "$tmp_iso_gz" "${tmp_iso_gz%.gz}"
+    log_and_exit "Failed to decompress OpenCore ISO" "$logfile"
+  fi
+
+  # Move decompressed file to final location
+  local tmp_iso="${tmp_iso_gz%.gz}"
   mv "$tmp_iso" "$iso_path" || log_and_exit "Failed to move OpenCore ISO to $iso_path" "$logfile"
+
   ensure_base64_xxd_dependency
   update_opencore_smbios "$iso_path" "$oc_json_path"
 

@@ -31,10 +31,11 @@ Run macOS on Proxmox VE (AMD & Intel) with automatic version detection and compa
 - **Better Error Handling** - ISO validation prevents broken VMs, automatic rollback on failures
 
 ### Proxmox 9.x Full Support
-- Automatic QEMU 10.x compatibility - script handles all breaking changes
-- Media parameter workarounds - bypasses strict ISO validation
-- ACPI hotplug fixes - prevents macOS boot failures
-- Machine version handling - works with new q35 defaults
+- **KVM-Opencore v21** - Uses thenickdude's KVM-specific OpenCore (critical for QEMU 10.x)
+- **Automatic CPU vendor detection** - Intel vs AMD host compatibility (vendor=GenuineIntel or AuthenticAMD)
+- **qm importdisk method** - Imports OpenCore and recovery ISOs as disk images (QEMU 10.x requirement)
+- **ACPI hotplug fixes** - Prevents macOS boot failures on q35 machine type
+- **Auto-detects Proxmox version** - Applies appropriate fixes for 7.x, 8.x, and 9.x
 
 ### Why This Fork?
 Original tutorials for Proxmox 8.4 don't work on 9.x. This version:
