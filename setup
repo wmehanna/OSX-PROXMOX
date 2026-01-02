@@ -399,7 +399,7 @@ set_isodir() {
   # SECURITY: Validate path against whitelist AND blacklist
   # First: Check blacklist (system-critical paths that must NEVER be used)
   case "$canonical_path" in
-    /|/etc|/etc/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/var/tmp|/var/tmp/*)
+    /|/etc|/etc/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/var/tmp|/var/tmp/*)
       log_and_exit "SECURITY: Storage cannot be in system directory: $canonical_path" "$logfile"
       ;;
   esac
@@ -413,7 +413,7 @@ set_isodir() {
     /[a-zA-Z][a-zA-Z0-9_-]*/*)
       # Ensure it's not a system directory disguised as pool name
       case "$canonical_path" in
-        /etc/*|/root/*|/usr/*|/bin/*|/sbin/*|/lib*|/boot/*|/dev/*|/proc/*|/sys/*|/var/tmp/*|/tmp/*)
+        /etc/*|/root/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/boot/*|/dev/*|/proc/*|/sys/*|/var/tmp/*|/tmp/*)
           log_and_exit "SECURITY: Storage cannot be in system directory: $canonical_path" "$logfile"
           ;;
       esac
@@ -1122,6 +1122,13 @@ customize_opencore_config() {
 update_opencore_iso() {
   local iso_path
   local logfile="${LOGDIR}/update-opencore-iso.log"
+
+  # CRITICAL: Prevent concurrent execution with file lock
+  exec 200>/var/lock/opencore-update.lock
+  if ! flock -n 200; then
+    log_and_exit "Another OpenCore update is already in progress" "$logfile"
+  fi
+
   # CRITICAL: Use thenickdude's KVM-Opencore v21 for Proxmox 9.x / QEMU 10.x compatibility
   # Generic OpenCore ISOs fail with "LoadImage failed - Unsupported" on QEMU 10.x
   #
@@ -1170,12 +1177,10 @@ update_opencore_iso() {
     [[ "$timestamp" =~ ^[0-9]+$ ]] || log_and_exit "Invalid timestamp format: $timestamp" "$logfile"
     backup_path="${ISODIR}/OpenCore-v21.iso.backup.${timestamp}"
 
-    if cp "$iso_path" "$backup_path" >>"$logfile" 2>&1; then
-      display_and_log "Created backup: OpenCore-v21.iso.backup.${timestamp}" "$logfile"
-    else
-      display_and_log "WARNING: Failed to create backup - continuing anyway" "$logfile"
-      backup_path=""  # Clear backup path if copy failed
+    if ! cp "$iso_path" "$backup_path" >>"$logfile" 2>&1; then
+      log_and_exit "CRITICAL: Cannot create backup (disk full or permission denied)" "$logfile"
     fi
+    display_and_log "Created backup: OpenCore-v21.iso.backup.${timestamp}" "$logfile"
   fi
 
   # Define rollback function to restore backup on failure
@@ -1329,8 +1334,7 @@ update_opencore_iso() {
       display_and_log "ISO checksum verified: OK" "$logfile"
     fi
   else
-    display_and_log "WARNING: sha256sum not available - cannot verify ISO integrity" "$logfile"
-    display_and_log "Install coreutils for checksum verification: apt-get install coreutils" "$logfile"
+    log_and_exit "sha256sum required for security. Install: apt-get install coreutils" "$logfile"
   fi
 
   # Decompress the .gz file
