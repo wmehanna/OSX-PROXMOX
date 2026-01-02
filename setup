@@ -520,9 +520,8 @@ create_vm() {
   local qemu_version=$(qemu-system-x86_64 --version | awk '/version/ {print $4}' | cut -d'(' -f1)
   version_compare "$qemu_version" "6.1" && device_args="$device_args -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
 
-  # Create VM with ISOs initially set as media=cdrom
-  # This is required because Proxmox 8.4+ enforces explicit media parameter validation
-  # and Proxmox 9.x with QEMU 10.x rejects media=disk for ISOs during VM creation
+  # Create VM without OpenCore ISO first (will import it as disk)
+  # Proxmox 9.x with QEMU 10.x requires OpenCore to be a proper disk image, not media=cdrom
   qm create "$vm_id" \
     --agent 1 --args "$device_args $cpu_args" --autostart 0 \
     --balloon 0 --bios ovmf --boot "order=ide0;$disk_type" \
@@ -532,34 +531,28 @@ create_vm() {
     --onboot 0 --ostype other --sockets 1 --start 0 --tablet 1 \
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
     --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" \
-    --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=96M" \
     --ide2 "${storage_iso}:iso/recovery-${version_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
 
-  # CRITICAL WORKAROUND for Proxmox 8.4+ and 9.x:
-  # Change media=cdrom to media=disk AFTER VM creation to bypass validation
-  # This allows OpenCore and macOS recovery ISOs to be treated as bootable disks
-  # Direct creation with media=disk fails in qm create but works when editing the config file
+  # CRITICAL: Import OpenCore ISO as a disk image for QEMU 10.x compatibility
+  # QEMU 10.x cannot boot ISOs with media=disk, and media=cdrom makes them unbootable
+  # Solution: Import the ISO as a raw disk image, then attach it
+  display_and_log "Importing OpenCore as disk image..." "$logfile"
 
-  # Validate VM ID and config path before modification
+  local opencore_iso_path="${ISODIR}${iso_file}"
+  qm importdisk "$vm_id" "$opencore_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import OpenCore disk" "$logfile"
+
+  # Find the imported disk (will be unusedN in config)
   local vm_conf="/etc/pve/qemu-server/${vm_id}.conf"
-  if [[ ! "$vm_id" =~ ^[0-9]+$ || ! -f "$vm_conf" ]]; then
-    log_and_exit "Invalid VM ID or config not found: $vm_id" "$logfile"
+  local unused_disk=$(grep "^unused" "$vm_conf" | head -1 | cut -d':' -f1)
+  local disk_path=$(grep "^$unused_disk" "$vm_conf" | cut -d' ' -f2)
+
+  if [[ -z "$disk_path" ]]; then
+    log_and_exit "Failed to find imported OpenCore disk" "$logfile"
   fi
 
-  # Create backup before modification
-  cp "$vm_conf" "${vm_conf}.backup-$(date +%s)" || log_and_exit "Failed to backup VM config" "$logfile"
-
-  # Apply workaround with rollback on failure
-  # CRITICAL: Only change ide0 (OpenCore) to media=disk, NOT ide2 (recovery ISO)
-  # Recovery ISO must stay as media=cdrom or UEFI will boot it instead of OpenCore
-  if ! sed -i '/^ide0:/s/media=cdrom/media=disk/' "$vm_conf" >>"$logfile" 2>&1; then
-    # Restore from backup if sed fails
-    mv "${vm_conf}.backup-"* "$vm_conf" 2>/dev/null
-    log_and_exit "Failed to update VM config" "$logfile"
-  fi
-
-  # Clean up backup on success
-  rm -f "${vm_conf}.backup-"* 2>/dev/null
+  # Attach imported disk to ide0 and remove from unused
+  qm set "$vm_id" -ide0 "$disk_path,cache=unsafe" >>"$logfile" 2>&1 || log_and_exit "Failed to attach OpenCore disk" "$logfile"
+  qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
 
   echo -e "${COLOR_GREEN}✓ VM ($vm_name) created successfully${COLOR_RESET}"
   display_and_log "VM ($vm_name) created successfully" "$logfile"

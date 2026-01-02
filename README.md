@@ -313,6 +313,11 @@ Press Enter for default
 
 **4.2 - OpenCore Boot Menu**
 
+**⚠️ IMPORTANT (Proxmox 9.x users):**
+- **Press SPACE repeatedly** as soon as the VM starts booting
+- This shows the OpenCore picker menu
+- Without pressing SPACE, the boot may auto-select and appear stuck
+
 You'll see:
 ```
 [#] macOS Install (DMG)     ← Select this
