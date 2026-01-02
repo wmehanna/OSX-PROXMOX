@@ -53,6 +53,8 @@ DHCP_CONF_DIR="/etc/dhcp/dhcpd.d"
 NETWORK_INTERFACES_FILE="/etc/network/interfaces"
 DHCP_USER="dhcpd"
 OPENCORE_ISO="OpenCore-v21.iso"
+readonly MIN_COMPRESSED_ISO_SIZE=1000000    # 1 MB minimum for .gz file
+readonly MIN_DECOMPRESSED_ISO_SIZE=10000000 # 10 MB minimum for .iso file
 
 # TUI Colors
 COLOR_RESET="\033[0m"
@@ -196,6 +198,13 @@ validate_vm_name() {
   [[ "$vm_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9]$ && ! "$vm_name" =~ [[:space:]] ]]
 }
 
+# Function to check if value has changed
+value_changed() {
+  local new_val="$1"
+  local old_val="$2"
+  [[ -n "$new_val" && "$new_val" != "$old_val" ]]
+}
+
 # Function to compare version numbers
 version_compare() {
   local v1=$1 v2=$2
@@ -223,7 +232,9 @@ get_available_storages() {
   local default_storage=""
 
   local storage_list
-  storage_list=$(pvesm status --content images 2>>"$logfile") || log_and_exit "Failed to retrieve storage list" "$logfile"
+  if ! storage_list=$(pvesm status --content images 2>>"$logfile"); then
+    log_and_exit "Failed to retrieve storage list" "$logfile"
+  fi
   while IFS= read -r line; do
     [[ "$line" =~ ^Name.* ]] && continue
     read -r storage_name type status total used avail percent <<< "$line"
@@ -311,7 +322,12 @@ ensure_gunzip_dependency() {
 set_isodir() {
   local logfile="${LOGDIR}/iso-storage-detection.log"
   ensure_jq_dependency
-  local storage_output=$(get_available_iso_storages) || { display_and_log "Failed to retrieve ISO storages"; read -n 1 -s; return 1; }
+  local storage_output
+  if ! storage_output=$(get_available_iso_storages); then
+    display_and_log "Failed to retrieve ISO storages"
+    read -n 1 -s
+    return 1
+  fi
   local storages=() default_storage=""
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -352,7 +368,9 @@ set_isodir() {
   fi
 
   local storage_iso_path
-  storage_iso_path=$(pvesh get /storage/"${storage_iso}" --output-format json | jq -r '.path') || log_and_exit "Failed to retrieve path for storage $storage_iso" "$logfile"
+  if ! storage_iso_path=$(pvesh get /storage/"${storage_iso}" --output-format json | jq -r '.path'); then
+    log_and_exit "Failed to retrieve path for storage $storage_iso" "$logfile"
+  fi
   [[ -z "$storage_iso_path" ]] && log_and_exit "Storage path for $storage_iso is empty" "$logfile"
 
   # CRITICAL: Validate storage path to prevent path injection attacks
@@ -362,13 +380,21 @@ set_isodir() {
 
   # Path must exist or be creatable
   if [[ -z "$canonical_path" ]]; then
+    # Empty can mean: symlink to non-existent target, parent doesn't exist, or permission denied
+    if [[ -L "${storage_iso_path}/template/iso/" ]]; then
+      log_and_exit "ISO path is broken symlink: ${storage_iso_path}/template/iso/" "$logfile"
+    fi
+
     # Try to create parent directory first
     mkdir -p "${storage_iso_path}/template/iso/" >>"$logfile" 2>&1 || \
-      log_and_exit "Failed to create ISO directory structure" "$logfile"
-    canonical_path=$(readlink -f "${storage_iso_path}/template/iso/" 2>/dev/null)
-  fi
+      log_and_exit "Failed to create ISO directory structure at ${storage_iso_path}/template/iso/" "$logfile"
 
-  [[ -z "$canonical_path" ]] && log_and_exit "Cannot resolve canonical path for $storage_iso_path" "$logfile"
+    canonical_path=$(readlink -f "${storage_iso_path}/template/iso/" 2>/dev/null)
+
+    if [[ -z "$canonical_path" ]]; then
+      log_and_exit "Cannot resolve canonical path for ${storage_iso_path}/template/iso/ (possible broken symlink or permission issue)" "$logfile"
+    fi
+  fi
 
   # SECURITY: Validate path against whitelist AND blacklist
   # First: Check blacklist (system-critical paths that must NEVER be used)
@@ -378,13 +404,22 @@ set_isodir() {
       ;;
   esac
 
-  # Second: Check whitelist (only allow known Proxmox storage paths)
+  # Second: Check whitelist (allow Proxmox defaults + common ZFS pools)
   case "$canonical_path" in
+    # Proxmox default paths
     /var/lib/vz/*|/mnt/*|/srv/*)
-      # Allowed - continue
+      ;;
+    # Common ZFS pool mountpoints (allow any top-level pool except system dirs)
+    /[a-zA-Z0-9_-]*[a-zA-Z0-9]/*)
+      # Ensure it's not a system directory disguised as pool name
+      case "$canonical_path" in
+        /etc/*|/root/*|/usr/*|/bin/*|/sbin/*|/lib*|/boot/*|/dev/*|/proc/*|/sys/*|/var/tmp/*|/tmp/*)
+          log_and_exit "SECURITY: Storage cannot be in system directory: $canonical_path" "$logfile"
+          ;;
+      esac
       ;;
     *)
-      log_and_exit "SECURITY: Storage path outside allowed directories: $canonical_path" "$logfile"
+      log_and_exit "SECURITY: Storage path outside allowed directories: $canonical_path (expected /var/lib/vz/*, /mnt/*, /srv/*, or ZFS pool like /tank/*)" "$logfile"
       ;;
   esac
 
@@ -663,7 +698,7 @@ update_opencore_smbios() {
     if [[ "${GENSMBIOS:-Y}" =~ ^[Yy]$ ]]; then
       SystemProductName="iMacPro1,1"
       read -e -p "Enter System Product Name (press Enter to keep current): " -i "$SystemProductName" new_value
-        if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
+        if value_changed "$new_value" "$SystemProductName"; then
           SystemProductName="$new_value"
         fi
 
@@ -897,7 +932,7 @@ customize_opencore_config() {
   if $generate_new; then
     SystemProductName="$(read_plist_value "$TEMP_FILE" "$platform_generic_xpath" "SystemProductName")"
     read -e -p "Enter System Product Name (press Enter to keep current): " -i "$SystemProductName" new_value
-      if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
+      if value_changed "$new_value" "$SystemProductName"; then
         SystemProductName="$new_value"
       fi
 
@@ -959,7 +994,7 @@ customize_opencore_config() {
         continue
       fi
       read -e -p "Edit value (press Enter to keep current): " -i "$current_value" new_value
-      if [ -n "$new_value" ] && [ "$new_value" != "$current_value" ]; then
+      if value_changed "$new_value" "$current_value"; then
         modified[$key]="$new_value"
       fi
     elif [ "$key" == "ROM" ]; then
@@ -972,7 +1007,7 @@ customize_opencore_config() {
       fi
       echo "Current value for $key (${rom_convert:+HEX}base64 if not): $current_value"
       read -e -p "Edit value (press Enter to keep current): " -i "$current_value" new_value
-      if [ -n "$new_value" ] && [ "$new_value" != "$current_value" ]; then
+      if value_changed "$new_value" "$current_value"; then
         if $rom_convert; then
           modified[$key]=$(echo -n "$new_value" | xxd -r -p | base64)
         else
@@ -983,7 +1018,7 @@ customize_opencore_config() {
       current_value="$value"
       echo "Current value for $key: $current_value"
       read -e -p "Edit value (press Enter to keep current): " -i "$current_value" new_value
-      if [ -n "$new_value" ] && [ "$new_value" != "$current_value" ]; then
+      if value_changed "$new_value" "$current_value"; then
         modified[$key]="$new_value"
       fi
     fi
@@ -1109,8 +1144,16 @@ update_opencore_iso() {
     local isodir_realpath
     isodir_realpath=$(readlink -f "$ISODIR" 2>/dev/null)
 
-    if [[ -z "$iso_realpath" || -z "$isodir_realpath" ]]; then
-      log_and_exit "Failed to resolve paths for backup validation" "$logfile"
+    if [[ -z "$iso_realpath" ]]; then
+      if [[ -L "$iso_path" ]]; then
+        log_and_exit "ISO path is broken symlink: $iso_path" "$logfile"
+      else
+        log_and_exit "Cannot resolve ISO path: $iso_path (parent directory may not exist)" "$logfile"
+      fi
+    fi
+
+    if [[ -z "$isodir_realpath" ]]; then
+      log_and_exit "Cannot resolve ISODIR: $ISODIR (broken symlink or missing directory)" "$logfile"
     fi
 
     # Ensure iso_path is under ISODIR (prevent escaping via ../)
@@ -1133,6 +1176,9 @@ update_opencore_iso() {
 
   # Define rollback function to restore backup on failure
   restore_opencore_backup() {
+    # Disable EXIT trap to prevent cleanup race condition
+    trap - EXIT
+
     if [[ -n "$backup_path" && -f "$backup_path" ]]; then
       display_and_log "ROLLBACK: Restoring from backup due to update failure..." "$logfile"
       if mv "$backup_path" "$iso_path" >>"$logfile" 2>&1; then
@@ -1141,10 +1187,13 @@ update_opencore_iso() {
         display_and_log "CRITICAL: Backup restore failed! Manual recovery needed at: $backup_path" "$logfile"
       fi
     fi
+
+    # Re-enable EXIT trap for normal cleanup
+    trap cleanup EXIT
   }
 
-  # Set trap to auto-rollback on script errors
-  trap restore_opencore_backup ERR
+  # Set trap to auto-rollback on script errors and exit immediately
+  trap 'restore_opencore_backup; trap - ERR EXIT; exit 1' ERR
 
   # CRITICAL: Remove ALL old OpenCore variants to prevent version conflicts
   # This ensures only the correct KVM-Opencore v21 is present
@@ -1161,6 +1210,8 @@ update_opencore_iso() {
 
   local removed_count=0
   local skipped_files=()
+  local skipped_count=0
+  local MAX_SKIPPED_DISPLAY=10
   local lsof_available=false
 
   # Check lsof availability once
@@ -1185,10 +1236,16 @@ update_opencore_iso() {
             # flock failed = file locked/in-use or permission denied
             if lsof "$iso_file" >/dev/null 2>&1; then
               display_and_log "  WARNING: $iso_name in use by VM - skipping" "$logfile"
-              skipped_files+=("$iso_name (in use)")
+              if (( skipped_count < MAX_SKIPPED_DISPLAY )); then
+                skipped_files+=("$iso_name (in use)")
+              fi
+              ((skipped_count++))
             else
               display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
-              skipped_files+=("$iso_name (permission denied)")
+              if (( skipped_count < MAX_SKIPPED_DISPLAY )); then
+                skipped_files+=("$iso_name (permission denied)")
+              fi
+              ((skipped_count++))
             fi
           fi
         else
@@ -1198,7 +1255,10 @@ update_opencore_iso() {
             ((removed_count++))
           else
             display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
-            skipped_files+=("$iso_name (failed)")
+            if (( skipped_count < MAX_SKIPPED_DISPLAY )); then
+              skipped_files+=("$iso_name (failed)")
+            fi
+            ((skipped_count++))
           fi
         fi
       fi
@@ -1214,8 +1274,14 @@ update_opencore_iso() {
   fi
 
   display_and_log "Cleanup: removed $removed_count old files" "$logfile"
-  if [ ${#skipped_files[@]} -gt 0 ]; then
-    display_and_log "WARNING: Skipped ${#skipped_files[@]} files: ${skipped_files[*]}" "$logfile"
+  if (( skipped_count > 0 )); then
+    display_and_log "WARNING: Skipped $skipped_count files" "$logfile"
+    if (( ${#skipped_files[@]} > 0 )); then
+      display_and_log "First $MAX_SKIPPED_DISPLAY: ${skipped_files[*]}" "$logfile"
+    fi
+    if (( skipped_count > MAX_SKIPPED_DISPLAY )); then
+      display_and_log "... and $((skipped_count - MAX_SKIPPED_DISPLAY)) more" "$logfile"
+    fi
   fi
 
   # Ensure gunzip is installed before downloading
@@ -1231,7 +1297,7 @@ update_opencore_iso() {
   # Verify download completed (minimum size check prevents corrupted/partial downloads)
   local file_size
   file_size=$(wc -c < "$tmp_iso_gz" 2>/dev/null | tr -d ' ' || echo 0)
-  if [ "$file_size" -lt 1000000 ]; then  # OpenCore v21.iso.gz should be ~12-15MB
+  if [ "$file_size" -lt "$MIN_COMPRESSED_ISO_SIZE" ]; then  # OpenCore v21.iso.gz should be ~12-15MB
     rm -f "$tmp_iso_gz"
     log_and_exit "Downloaded ISO too small (${file_size} bytes) - likely corrupted or incomplete" "$logfile"
   fi
@@ -1243,7 +1309,10 @@ update_opencore_iso() {
     # Source: https://github.com/thenickdude/KVM-Opencore/releases/tag/v21
     local expected_sha256="c0b1230dcccf54f5d3485afc97bc0f84c11cccf2e72c3cfb1fc9ef23e3f3b503"
     local actual_sha256
-    actual_sha256=$(sha256sum "$tmp_iso_gz" | cut -d' ' -f1)
+    if ! actual_sha256=$(sha256sum "$tmp_iso_gz" 2>>"$logfile" | cut -d' ' -f1); then
+      display_and_log "WARNING: Failed to calculate checksum" "$logfile"
+      actual_sha256=""
+    fi
 
     if [ "$actual_sha256" != "$expected_sha256" ]; then
       display_and_log "WARNING: ISO checksum mismatch!" "$logfile"
@@ -1283,7 +1352,7 @@ update_opencore_iso() {
 
   local decompressed_size
   decompressed_size=$(wc -c < "$tmp_iso" 2>/dev/null | tr -d ' ' || echo 0)
-  if [ "$decompressed_size" -lt 10000000 ]; then  # Should be ~100-150MB decompressed
+  if [ "$decompressed_size" -lt "$MIN_DECOMPRESSED_ISO_SIZE" ]; then  # Should be ~100-150MB decompressed
     rm -f "$tmp_iso"
     log_and_exit "Decompressed ISO too small (${decompressed_size} bytes) - corrupted" "$logfile"
   fi
