@@ -1095,6 +1095,33 @@ update_opencore_iso() {
   iso_path="${ISODIR}/${OPENCORE_ISO}"
   oc_json_path="${ISODIR}/.smbios.json"
 
+  # CRITICAL: Backup existing OpenCore-v21.iso before update (enables rollback on failure)
+  local backup_path=""
+  if [[ -f "$iso_path" ]]; then
+    backup_path="${iso_path}.backup.$(date +%s)"
+    if cp "$iso_path" "$backup_path" >>"$logfile" 2>&1; then
+      display_and_log "Created backup: ${backup_path##*/}" "$logfile"
+    else
+      display_and_log "WARNING: Failed to create backup - continuing anyway" "$logfile"
+      backup_path=""  # Clear backup path if copy failed
+    fi
+  fi
+
+  # Define rollback function to restore backup on failure
+  restore_opencore_backup() {
+    if [[ -n "$backup_path" && -f "$backup_path" ]]; then
+      display_and_log "ROLLBACK: Restoring from backup due to update failure..." "$logfile"
+      if mv "$backup_path" "$iso_path" >>"$logfile" 2>&1; then
+        display_and_log "Backup restored successfully" "$logfile"
+      else
+        display_and_log "CRITICAL: Backup restore failed! Manual recovery needed at: $backup_path" "$logfile"
+      fi
+    fi
+  }
+
+  # Set trap to auto-rollback on script errors
+  trap restore_opencore_backup ERR
+
   # CRITICAL: Remove ALL old OpenCore variants to prevent version conflicts
   # This ensures only the correct KVM-Opencore v21 is present
   display_and_log "Cleaning up old OpenCore files..." "$logfile"
@@ -1187,6 +1214,13 @@ update_opencore_iso() {
 
   ensure_base64_xxd_dependency
   update_opencore_smbios "$iso_path" "$oc_json_path"
+
+  # Success! Remove backup and disable rollback trap
+  trap - ERR
+  if [[ -n "$backup_path" && -f "$backup_path" ]]; then
+    rm -f "$backup_path" >>"$logfile" 2>&1
+    display_and_log "Update successful - removed backup" "$logfile"
+  fi
 
   display_and_log "OpenCore ISO updated" "$logfile"
   sleep 5
