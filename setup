@@ -353,8 +353,40 @@ set_isodir() {
   local storage_iso_path
   storage_iso_path=$(pvesh get /storage/"${storage_iso}" --output-format json | jq -r '.path') || log_and_exit "Failed to retrieve path for storage $storage_iso" "$logfile"
   [[ -z "$storage_iso_path" ]] && log_and_exit "Storage path for $storage_iso is empty" "$logfile"
-  ISODIR="${storage_iso_path}/template/iso/"
-  mkdir -p "$ISODIR" || log_and_exit "Failed to create ISODIR: $ISODIR" "$logfile"
+
+  # CRITICAL: Validate storage path to prevent path injection attacks
+  # Resolve to canonical path (no symlinks, no ..)
+  local canonical_path
+  canonical_path=$(readlink -f "${storage_iso_path}/template/iso/" 2>/dev/null)
+
+  # Path must exist or be creatable
+  if [[ -z "$canonical_path" ]]; then
+    # Try to create parent directory first
+    mkdir -p "${storage_iso_path}/template/iso/" >>"$logfile" 2>&1 || \
+      log_and_exit "Failed to create ISO directory structure" "$logfile"
+    canonical_path=$(readlink -f "${storage_iso_path}/template/iso/" 2>/dev/null)
+  fi
+
+  [[ -z "$canonical_path" ]] && log_and_exit "Cannot resolve canonical path for $storage_iso_path" "$logfile"
+
+  # SECURITY: Whitelist check - must be under common Proxmox storage paths
+  if [[ ! "$canonical_path" =~ ^/var/lib/vz/ ]] && \
+     [[ ! "$canonical_path" =~ ^/mnt/ ]] && \
+     [[ ! "$canonical_path" =~ ^/srv/ ]]; then
+    log_and_exit "SECURITY: Storage path outside allowed directories: $canonical_path" "$logfile"
+  fi
+
+  # SECURITY: Block system-critical paths
+  case "$canonical_path" in
+    /|/etc|/etc/*|/root|/root/*|/usr|/usr/*|/var|/bin|/bin/*|/sbin|/sbin/*|/lib*|/boot|/boot/*)
+      log_and_exit "SECURITY: Storage cannot be in system directory: $canonical_path" "$logfile"
+      ;;
+  esac
+
+  # Must be an actual directory
+  [[ -d "$canonical_path" ]] || log_and_exit "Storage path is not a directory: $canonical_path" "$logfile"
+
+  ISODIR="$canonical_path"
   display_and_log "ISODIR set to: $ISODIR" "$logfile"
 }
 
@@ -1066,16 +1098,49 @@ update_opencore_iso() {
   # CRITICAL: Remove ALL old OpenCore variants to prevent version conflicts
   # This ensures only the correct KVM-Opencore v21 is present
   display_and_log "Cleaning up old OpenCore files..." "$logfile"
+
+  declare -a old_isos=(
+    "opencore-osx-proxmox-vm.iso"
+    "opencore-autoboot.iso"
+    "opencore-original.img"
+    "opencore-original.iso"
+    "opencore-v21.img"
+    "opencore-trumb.iso"
+  )
+
+  local removed_count=0
+  local skipped_files=()
+
   if [[ -d "$ISODIR" && -n "$ISODIR" ]]; then
-    # Remove old generic OpenCore ISOs
-    rm -f "${ISODIR}/opencore-osx-proxmox-vm.iso" >>"$logfile" 2>&1
-    rm -f "${ISODIR}/opencore-autoboot.iso" >>"$logfile" 2>&1
-    rm -f "${ISODIR}/opencore-original.img" >>"$logfile" 2>&1
-    rm -f "${ISODIR}/opencore-original.iso" >>"$logfile" 2>&1
-    rm -f "${ISODIR}/opencore-v21.img" >>"$logfile" 2>&1
-    rm -f "${ISODIR}/opencore-trumb.iso" >>"$logfile" 2>&1
+    for iso_name in "${old_isos[@]}"; do
+      local iso_file="${ISODIR}/${iso_name}"
+      if [[ -f "$iso_file" ]]; then
+        # Check if file is in use by checking for open file handles
+        if command -v lsof >/dev/null 2>&1 && lsof "$iso_file" >/dev/null 2>&1; then
+          display_and_log "  WARNING: $iso_name in use by VM - skipping" "$logfile"
+          skipped_files+=("$iso_name (in use)")
+        elif rm -f "$iso_file" >>"$logfile" 2>&1; then
+          display_and_log "  Removed: $iso_name" "$logfile"
+          ((removed_count++))
+        else
+          display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
+          skipped_files+=("$iso_name (permission denied)")
+        fi
+      fi
+    done
+
     # Remove current OpenCore-v21.iso if exists (will be re-downloaded)
-    rm -f "$iso_path" >>"$logfile" 2>&1
+    if [[ -f "$iso_path" ]]; then
+      if command -v lsof >/dev/null 2>&1 && lsof "$iso_path" >/dev/null 2>&1; then
+        log_and_exit "ERROR: ${OPENCORE_ISO} currently in use by VM. Stop VMs before updating." "$logfile"
+      fi
+      rm -f "$iso_path" >>"$logfile" 2>&1
+    fi
+  fi
+
+  display_and_log "Cleanup: removed $removed_count old files" "$logfile"
+  if [ ${#skipped_files[@]} -gt 0 ]; then
+    display_and_log "WARNING: Skipped ${#skipped_files[@]} files: ${skipped_files[*]}" "$logfile"
   fi
 
   # Ensure gunzip is installed before downloading
