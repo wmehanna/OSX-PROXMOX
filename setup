@@ -624,7 +624,7 @@ create_vm() {
   # Solution: Import the ISO as a raw disk image, then attach it
   display_and_log "Importing OpenCore as disk image..." "$logfile"
 
-  local opencore_iso_path="${ISODIR}${iso_file}"
+  local opencore_iso_path="${ISODIR}/${iso_file}"
   qm importdisk "$vm_id" "$opencore_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import OpenCore disk" "$logfile"
 
   # Find the imported OpenCore disk (will be unusedN in config)
@@ -644,7 +644,7 @@ create_vm() {
   # OpenCore only scans disk devices, not media=cdrom, so recovery ISO must be imported as disk
   display_and_log "Importing macOS Recovery as disk image..." "$logfile"
 
-  local recovery_iso_path="${ISODIR}recovery-${version_name,,}.iso"
+  local recovery_iso_path="${ISODIR}/recovery-${version_name,,}.iso"
   qm importdisk "$vm_id" "$recovery_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import Recovery disk" "$logfile"
 
   # Find the imported Recovery disk (will be unusedN in config)
