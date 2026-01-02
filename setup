@@ -520,8 +520,9 @@ create_vm() {
   local qemu_version=$(qemu-system-x86_64 --version | awk '/version/ {print $4}' | cut -d'(' -f1)
   version_compare "$qemu_version" "6.1" && device_args="$device_args -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
 
-  # Create VM without OpenCore ISO first (will import it as disk)
-  # Proxmox 9.x with QEMU 10.x requires OpenCore to be a proper disk image, not media=cdrom
+  # Create VM without ISOs (will import both OpenCore and Recovery as disks)
+  # Proxmox 9.x with QEMU 10.x requires both ISOs to be proper disk images, not media=cdrom
+  # OpenCore cannot detect ISO files with media=cdrom parameter
   qm create "$vm_id" \
     --agent 1 --args "$device_args $cpu_args" --autostart 0 \
     --balloon 0 --bios ovmf --boot "order=ide0;$disk_type" \
@@ -530,8 +531,7 @@ create_vm() {
     --name "$vm_name" --net0 "vmxnet3,bridge=$bridge" --numa 0 \
     --onboot 0 --ostype other --sockets 1 --start 0 --tablet 1 \
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
-    --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" \
-    --ide2 "${storage_iso}:iso/recovery-${version_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
+    --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
 
   # CRITICAL: Import OpenCore ISO as a disk image for QEMU 10.x compatibility
   # QEMU 10.x cannot boot ISOs with media=disk, and media=cdrom makes them unbootable
@@ -541,7 +541,7 @@ create_vm() {
   local opencore_iso_path="${ISODIR}${iso_file}"
   qm importdisk "$vm_id" "$opencore_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import OpenCore disk" "$logfile"
 
-  # Find the imported disk (will be unusedN in config)
+  # Find the imported OpenCore disk (will be unusedN in config)
   local vm_conf="/etc/pve/qemu-server/${vm_id}.conf"
   local unused_disk=$(grep "^unused" "$vm_conf" | head -1 | cut -d':' -f1)
   local disk_path=$(grep "^$unused_disk" "$vm_conf" | cut -d' ' -f2)
@@ -550,8 +550,27 @@ create_vm() {
     log_and_exit "Failed to find imported OpenCore disk" "$logfile"
   fi
 
-  # Attach imported disk to ide0 and remove from unused
+  # Attach imported OpenCore disk to ide0 and remove from unused
   qm set "$vm_id" -ide0 "$disk_path,cache=unsafe" >>"$logfile" 2>&1 || log_and_exit "Failed to attach OpenCore disk" "$logfile"
+  qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
+
+  # CRITICAL: Import Recovery ISO as a disk image for OpenCore compatibility
+  # OpenCore only scans disk devices, not media=cdrom, so recovery ISO must be imported as disk
+  display_and_log "Importing macOS Recovery as disk image..." "$logfile"
+
+  local recovery_iso_path="${ISODIR}recovery-${version_name,,}.iso"
+  qm importdisk "$vm_id" "$recovery_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import Recovery disk" "$logfile"
+
+  # Find the imported Recovery disk (will be unusedN in config)
+  unused_disk=$(grep "^unused" "$vm_conf" | head -1 | cut -d':' -f1)
+  disk_path=$(grep "^$unused_disk" "$vm_conf" | cut -d' ' -f2)
+
+  if [[ -z "$disk_path" ]]; then
+    log_and_exit "Failed to find imported Recovery disk" "$logfile"
+  fi
+
+  # Attach imported Recovery disk to ide2 and remove from unused
+  qm set "$vm_id" -ide2 "$disk_path,cache=unsafe" >>"$logfile" 2>&1 || log_and_exit "Failed to attach Recovery disk" "$logfile"
   qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
 
   echo -e "${COLOR_GREEN}✓ VM ($vm_name) created successfully${COLOR_RESET}"
