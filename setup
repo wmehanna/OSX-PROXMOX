@@ -1050,14 +1050,31 @@ customize_opencore_config() {
 update_opencore_iso() {
   local iso_path
   local logfile="${LOGDIR}/update-opencore-iso.log"
-  # CRITICAL: Use thenickdude's KVM-Opencore for Proxmox 9.x / QEMU 10.x compatibility
-  # Generic OpenCore fails with "LoadImage failed - Unsupported" on QEMU 10.x
+  # CRITICAL: Use thenickdude's KVM-Opencore v21 for Proxmox 9.x / QEMU 10.x compatibility
+  # Generic OpenCore ISOs fail with "LoadImage failed - Unsupported" on QEMU 10.x
+  #
+  # KVM-Opencore v21 officially supports: Catalina, Big Sur, Monterey, Ventura
+  # Tested working: Monterey (confirmed), Ventura (confirmed)
+  # Community reports: Sonoma and Sequoia also work with v21 (unofficial/untested)
+  #
+  # Source: https://github.com/thenickdude/KVM-Opencore/releases/tag/v21
+  # Forum: https://forum.proxmox.com/threads/mac-os-15-sequoia-on-proxmox-9-0-3.169742/
   local iso_url="https://github.com/thenickdude/KVM-Opencore/releases/download/v21/OpenCore-v21.iso.gz"
   iso_path="${ISODIR}/${OPENCORE_ISO}"
   oc_json_path="${ISODIR}/.smbios.json"
 
-  # Safe removal with path validation
-  if [[ -f "$iso_path" && "$iso_path" =~ ^/.+/[^/]+\.iso$ ]]; then
+  # CRITICAL: Remove ALL old OpenCore variants to prevent version conflicts
+  # This ensures only the correct KVM-Opencore v21 is present
+  display_and_log "Cleaning up old OpenCore files..." "$logfile"
+  if [[ -d "$ISODIR" && -n "$ISODIR" ]]; then
+    # Remove old generic OpenCore ISOs
+    rm -f "${ISODIR}/opencore-osx-proxmox-vm.iso" >>"$logfile" 2>&1
+    rm -f "${ISODIR}/opencore-autoboot.iso" >>"$logfile" 2>&1
+    rm -f "${ISODIR}/opencore-original.img" >>"$logfile" 2>&1
+    rm -f "${ISODIR}/opencore-original.iso" >>"$logfile" 2>&1
+    rm -f "${ISODIR}/opencore-v21.img" >>"$logfile" 2>&1
+    rm -f "${ISODIR}/opencore-trumb.iso" >>"$logfile" 2>&1
+    # Remove current OpenCore-v21.iso if exists (will be re-downloaded)
     rm -f "$iso_path" >>"$logfile" 2>&1
   fi
 
@@ -1793,7 +1810,22 @@ clear
 init_dirs
 check_proxmox_version
 set_isodir
-# Check if OpenCore ISO exists, and install if not in the ISODIR.
+
+# CRITICAL: Force OpenCore v21 update if old generic OpenCore ISOs exist
+# This prevents version conflicts and ensures QEMU 10.x compatibility
+if [[ -f "${ISODIR}/opencore-osx-proxmox-vm.iso" ]] || \
+   [[ -f "${ISODIR}/opencore-autoboot.iso" ]] || \
+   [[ -f "${ISODIR}/opencore-original.iso" ]] || \
+   [[ -f "${ISODIR}/opencore-original.img" ]]; then
+  echo "=================================================="
+  echo "  WARNING: Old OpenCore ISOs detected!"
+  echo "  Forcing update to KVM-Opencore v21..."
+  echo "=================================================="
+  sleep 2
+  update_opencore_iso "0"
+fi
+
+# Check if OpenCore v21 ISO exists, and download if not in the ISODIR
 if [ ! -f "${ISODIR}/${OPENCORE_ISO}" ]; then
   update_opencore_iso "0"
 fi
