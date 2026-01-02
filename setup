@@ -1088,14 +1088,36 @@ update_opencore_iso() {
     log_and_exit "Failed to download OpenCore ISO from $iso_url" "$logfile"
   fi
 
+  # Verify download completed (minimum size check prevents corrupted/partial downloads)
+  local file_size
+  file_size=$(stat -c%s "$tmp_iso_gz" 2>/dev/null || echo 0)
+  if [ "$file_size" -lt 1000000 ]; then  # OpenCore v21.iso.gz should be ~12-15MB
+    rm -f "$tmp_iso_gz"
+    log_and_exit "Downloaded ISO too small (${file_size} bytes) - likely corrupted or incomplete" "$logfile"
+  fi
+  display_and_log "Download complete: ${file_size} bytes" "$logfile"
+
   # Decompress the .gz file
   if ! gunzip -f "$tmp_iso_gz" >>"$logfile" 2>&1; then
     rm -f "$tmp_iso_gz" "${tmp_iso_gz%.gz}"
     log_and_exit "Failed to decompress OpenCore ISO" "$logfile"
   fi
 
-  # Move decompressed file to final location
+  # Verify decompressed ISO exists and has reasonable size
   local tmp_iso="${tmp_iso_gz%.gz}"
+  if [ ! -f "$tmp_iso" ]; then
+    log_and_exit "Decompressed ISO not found at $tmp_iso" "$logfile"
+  fi
+
+  local decompressed_size
+  decompressed_size=$(stat -c%s "$tmp_iso" 2>/dev/null || echo 0)
+  if [ "$decompressed_size" -lt 10000000 ]; then  # Should be ~100-150MB decompressed
+    rm -f "$tmp_iso"
+    log_and_exit "Decompressed ISO too small (${decompressed_size} bytes) - corrupted" "$logfile"
+  fi
+  display_and_log "Decompression complete: ${decompressed_size} bytes" "$logfile"
+
+  # Move decompressed file to final location
   mv "$tmp_iso" "$iso_path" || log_and_exit "Failed to move OpenCore ISO to $iso_path" "$logfile"
 
   ensure_base64_xxd_dependency
@@ -1811,22 +1833,31 @@ init_dirs
 check_proxmox_version
 set_isodir
 
-# CRITICAL: Force OpenCore v21 update if old generic OpenCore ISOs exist
-# This prevents version conflicts and ensures QEMU 10.x compatibility
+# CRITICAL: Determine if OpenCore v21 update needed (prevents double-execution race condition)
+# Check for old ISOs OR missing v21 ISO, then update ONCE
+needs_opencore_update=false
+
 if [[ -f "${ISODIR}/opencore-osx-proxmox-vm.iso" ]] || \
    [[ -f "${ISODIR}/opencore-autoboot.iso" ]] || \
    [[ -f "${ISODIR}/opencore-original.iso" ]] || \
-   [[ -f "${ISODIR}/opencore-original.img" ]]; then
+   [[ -f "${ISODIR}/opencore-original.img" ]] || \
+   [[ -f "${ISODIR}/opencore-v21.img" ]] || \
+   [[ -f "${ISODIR}/opencore-trumb.iso" ]]; then
   echo "=================================================="
   echo "  WARNING: Old OpenCore ISOs detected!"
   echo "  Forcing update to KVM-Opencore v21..."
   echo "=================================================="
-  sleep 2
-  update_opencore_iso "0"
+  needs_opencore_update=true
 fi
 
-# Check if OpenCore v21 ISO exists, and download if not in the ISODIR
 if [ ! -f "${ISODIR}/${OPENCORE_ISO}" ]; then
+  [ "$needs_opencore_update" = false ] && echo "OpenCore v21 ISO not found, downloading..."
+  needs_opencore_update=true
+fi
+
+# Execute update only once if needed
+if [ "$needs_opencore_update" = true ]; then
+  sleep 2
   update_opencore_iso "0"
 fi
 sleep 4
