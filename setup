@@ -53,8 +53,8 @@ DHCP_CONF_DIR="/etc/dhcp/dhcpd.d"
 NETWORK_INTERFACES_FILE="/etc/network/interfaces"
 DHCP_USER="dhcpd"
 OPENCORE_ISO="OpenCore-v21.iso"
-readonly MIN_COMPRESSED_ISO_SIZE=1000000    # 1 MB minimum for .gz file
-readonly MIN_DECOMPRESSED_ISO_SIZE=10000000 # 10 MB minimum for .iso file
+readonly MIN_COMPRESSED_ISO_SIZE=10000000    # 10 MB minimum (v21 is ~13MB compressed)
+readonly MIN_DECOMPRESSED_ISO_SIZE=90000000  # 90 MB minimum (v21 is ~140MB decompressed)
 
 # TUI Colors
 COLOR_RESET="\033[0m"
@@ -409,8 +409,8 @@ set_isodir() {
     # Proxmox default paths
     /var/lib/vz/*|/mnt/*|/srv/*)
       ;;
-    # Common ZFS pool mountpoints (allow any top-level pool except system dirs)
-    /[a-zA-Z0-9_-]*[a-zA-Z0-9]/*)
+    # Common ZFS pool mountpoints (require 2+ chars, start with letter)
+    /[a-zA-Z][a-zA-Z0-9_-]*/*)
       # Ensure it's not a system directory disguised as pool name
       case "$canonical_path" in
         /etc/*|/root/*|/usr/*|/bin/*|/sbin/*|/lib*|/boot/*|/dev/*|/proc/*|/sys/*|/var/tmp/*|/tmp/*)
@@ -1139,21 +1139,22 @@ update_opencore_iso() {
   local backup_path=""
   if [[ -f "$iso_path" ]]; then
     # Validate iso_path is inside ISODIR (prevents path traversal)
-    local iso_realpath
-    iso_realpath=$(readlink -f "$iso_path" 2>/dev/null)
-    local isodir_realpath
-    isodir_realpath=$(readlink -f "$ISODIR" 2>/dev/null)
-
-    if [[ -z "$iso_realpath" ]]; then
-      if [[ -L "$iso_path" ]]; then
-        log_and_exit "ISO path is broken symlink: $iso_path" "$logfile"
-      else
-        log_and_exit "Cannot resolve ISO path: $iso_path (parent directory may not exist)" "$logfile"
-      fi
+    # Portable broken symlink detection (works on Linux and macOS)
+    if [[ -L "$iso_path" && ! -e "$iso_path" ]]; then
+      log_and_exit "ISO path is broken symlink: $iso_path" "$logfile"
+    fi
+    if [[ -L "$ISODIR" && ! -e "$ISODIR" ]]; then
+      log_and_exit "ISODIR is broken symlink: $ISODIR" "$logfile"
     fi
 
-    if [[ -z "$isodir_realpath" ]]; then
-      log_and_exit "Cannot resolve ISODIR: $ISODIR (broken symlink or missing directory)" "$logfile"
+    local iso_realpath
+    if ! iso_realpath=$(readlink -f "$iso_path" 2>>"$logfile"); then
+      log_and_exit "Cannot resolve ISO path: $iso_path" "$logfile"
+    fi
+
+    local isodir_realpath
+    if ! isodir_realpath=$(readlink -f "$ISODIR" 2>>"$logfile"); then
+      log_and_exit "Cannot resolve ISODIR: $ISODIR" "$logfile"
     fi
 
     # Ensure iso_path is under ISODIR (prevent escaping via ../)
@@ -1163,7 +1164,10 @@ update_opencore_iso() {
 
     # Create timestamped backup with safe filename
     local timestamp
-    timestamp=$(date +%s)
+    if ! timestamp=$(date +%s 2>>"$logfile"); then
+      log_and_exit "Failed to generate timestamp for backup" "$logfile"
+    fi
+    [[ "$timestamp" =~ ^[0-9]+$ ]] || log_and_exit "Invalid timestamp format: $timestamp" "$logfile"
     backup_path="${ISODIR}/OpenCore-v21.iso.backup.${timestamp}"
 
     if cp "$iso_path" "$backup_path" >>"$logfile" 2>&1; then
@@ -1315,21 +1319,12 @@ update_opencore_iso() {
     fi
 
     if [ "$actual_sha256" != "$expected_sha256" ]; then
-      display_and_log "WARNING: ISO checksum mismatch!" "$logfile"
+      rm -f "$tmp_iso_gz"
+      display_and_log "ERROR: ISO checksum verification failed!" "$logfile"
       display_and_log "Expected: $expected_sha256" "$logfile"
       display_and_log "Got:      $actual_sha256" "$logfile"
       display_and_log "This may indicate: corrupted download, MITM attack, or new OpenCore version" "$logfile"
-
-      # Auto-continue in non-interactive mode, fail in interactive
-      if [ -t 0 ]; then
-        read -rp "Continue anyway? (NOT recommended) [y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-          rm -f "$tmp_iso_gz"
-          log_and_exit "ISO checksum verification failed - update aborted" "$logfile"
-        fi
-      else
-        display_and_log "Non-interactive mode: accepting checksum mismatch" "$logfile"
-      fi
+      log_and_exit "Checksum mismatch - refusing to install potentially compromised ISO" "$logfile"
     else
       display_and_log "ISO checksum verified: OK" "$logfile"
     fi
@@ -1799,7 +1794,12 @@ configure_macos_vm() {
   fi
 
   # Storage Selection - interactive menu
-  local storage_output=$(get_available_storages) || { display_and_log "Failed to retrieve storages"; read -n 1 -s; return 1; }
+  local storage_output
+  if ! storage_output=$(get_available_storages); then
+    display_and_log "Failed to retrieve storages"
+    read -n 1 -s
+    return 1
+  fi
   local storages=() default_storage="" storage_options=()
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
