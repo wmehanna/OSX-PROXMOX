@@ -296,6 +296,16 @@ ensure_base64_xxd_dependency() {
   fi
 }
 
+# Function to ensure gunzip dependency is installed
+ensure_gunzip_dependency() {
+  local logfile="${1:-${LOGDIR}/gunzip-dependency.log}"
+  if ! command -v gunzip >/dev/null 2>&1; then
+    display_and_log "Installing gunzip..." "$logfile"
+    apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
+    apt-get install -y gzip >>"$logfile" 2>&1 || log_and_exit "Failed to install gunzip" "$logfile"
+  fi
+}
+
 # Function to set ISODIR based on selected ISO storage
 set_isodir() {
   local logfile="${LOGDIR}/iso-storage-detection.log"
@@ -504,15 +514,15 @@ create_vm() {
   else
     device_args="$device_args -device usb-kbd,bus=ehci.0,port=2 -device usb-mouse,bus=ehci.0,port=3"
   fi
-  # CRITICAL: CPU vendor string must match host CPU architecture
-  # AMD hosts: vendor=AuthenticAMD
-  # Intel hosts: vendor=GenuineIntel
-  # Mismatch causes macOS boot failures and kernel panics
+  # CRITICAL: macOS requires vendor=GenuineIntel even on AMD hosts
+  # macOS only runs on Intel CPUs - AMD systems must spoof Intel vendor ID
+  # The vendor string tells macOS what CPU vendor it sees, not physical hardware
+  # AMD hosts use AMD-specific CPU models (Penryn/Cascadelake) but report as Intel
   if [[ "$OSX_PLATFORM" == "AMD" ]]; then
     if [[ "$version_name" =~ ^(Ventura|Sonoma|Sequoia)$ ]]; then
-      cpu_args="-cpu Cascadelake-Server,vendor=AuthenticAMD,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
+      cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
     else
-      cpu_args="-cpu Penryn,kvm=on,vendor=AuthenticAMD,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
+      cpu_args="-cpu Penryn,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
     fi
   else
     cpu_args="-cpu host,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc"
@@ -635,8 +645,25 @@ update_opencore_smbios() {
 
   local loopdev=$(losetup -f --show -P "$iso_path") || log_and_exit "Failed to set up loop device" "$logfile"
   mkdir -p /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
-  mount "${loopdev}p1" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
-  local config="/mnt/opencore/EFI/OC/config.plist"
+
+  # Auto-detect partition structure (handles different OpenCore ISO formats)
+  local partition="${loopdev}p1"
+  if [ ! -b "$partition" ]; then
+    # Try without partition number (direct filesystem)
+    partition="$loopdev"
+  fi
+  mount "$partition" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
+
+  # Auto-detect config.plist path (handles different OpenCore structures)
+  local config
+  if [ -f "/mnt/opencore/EFI/OC/config.plist" ]; then
+    config="/mnt/opencore/EFI/OC/config.plist"
+  elif [ -f "/mnt/opencore/EFI/BOOT/config.plist" ]; then
+    config="/mnt/opencore/EFI/BOOT/config.plist"
+  else
+    config=$(find /mnt/opencore -name "config.plist" -type f 2>/dev/null | head -1)
+    [ -z "$config" ] && log_and_exit "Cannot find config.plist in OpenCore ISO" "$logfile"
+  fi
   [[ ! -e "$config.backup" ]] && cp "$config" "$config.backup" >>"$logfile" 2>&1
 
   # Temporary file
@@ -740,8 +767,25 @@ customize_opencore_config() {
 
   local loopdev=$(losetup -f --show -P "$iso") || log_and_exit "Failed to set up loop device" "$logfile"
   mkdir -p /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
-  mount "${loopdev}p1" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
-  local config="/mnt/opencore/EFI/OC/config.plist"
+
+  # Auto-detect partition structure (handles different OpenCore ISO formats)
+  local partition="${loopdev}p1"
+  if [ ! -b "$partition" ]; then
+    # Try without partition number (direct filesystem)
+    partition="$loopdev"
+  fi
+  mount "$partition" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
+
+  # Auto-detect config.plist path (handles different OpenCore structures)
+  local config
+  if [ -f "/mnt/opencore/EFI/OC/config.plist" ]; then
+    config="/mnt/opencore/EFI/OC/config.plist"
+  elif [ -f "/mnt/opencore/EFI/BOOT/config.plist" ]; then
+    config="/mnt/opencore/EFI/BOOT/config.plist"
+  else
+    config=$(find /mnt/opencore -name "config.plist" -type f 2>/dev/null | head -1)
+    [ -z "$config" ] && log_and_exit "Cannot find config.plist in OpenCore ISO" "$logfile"
+  fi
   [[ ! -e "$config.backup" ]] && cp "$config" "$config.backup" >>"$logfile" 2>&1
 
   # Temporary file
@@ -1016,6 +1060,9 @@ update_opencore_iso() {
   if [[ -f "$iso_path" && "$iso_path" =~ ^/.+/[^/]+\.iso$ ]]; then
     rm -f "$iso_path" >>"$logfile" 2>&1
   fi
+
+  # Ensure gunzip is installed before downloading
+  ensure_gunzip_dependency "$logfile"
 
   # Download compressed ISO with timeout and to temp file first
   local tmp_iso_gz="${iso_path}.tmp.gz"
