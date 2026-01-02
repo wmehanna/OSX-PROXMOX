@@ -1103,9 +1103,28 @@ update_opencore_iso() {
   # CRITICAL: Backup existing OpenCore-v21.iso before update (enables rollback on failure)
   local backup_path=""
   if [[ -f "$iso_path" ]]; then
-    backup_path="${iso_path}.backup.$(date +%s)"
+    # Validate iso_path is inside ISODIR (prevents path traversal)
+    local iso_realpath
+    iso_realpath=$(readlink -f "$iso_path" 2>/dev/null)
+    local isodir_realpath
+    isodir_realpath=$(readlink -f "$ISODIR" 2>/dev/null)
+
+    if [[ -z "$iso_realpath" || -z "$isodir_realpath" ]]; then
+      log_and_exit "Failed to resolve paths for backup validation" "$logfile"
+    fi
+
+    # Ensure iso_path is under ISODIR (prevent escaping via ../)
+    if [[ "$iso_realpath" != "$isodir_realpath"/* ]]; then
+      log_and_exit "SECURITY: ISO path outside ISODIR: $iso_realpath" "$logfile"
+    fi
+
+    # Create timestamped backup with safe filename
+    local timestamp
+    timestamp=$(date +%s)
+    backup_path="${ISODIR}/OpenCore-v21.iso.backup.${timestamp}"
+
     if cp "$iso_path" "$backup_path" >>"$logfile" 2>&1; then
-      display_and_log "Created backup: ${backup_path##*/}" "$logfile"
+      display_and_log "Created backup: OpenCore-v21.iso.backup.${timestamp}" "$logfile"
     else
       display_and_log "WARNING: Failed to create backup - continuing anyway" "$logfile"
       backup_path=""  # Clear backup path if copy failed
@@ -1142,28 +1161,52 @@ update_opencore_iso() {
 
   local removed_count=0
   local skipped_files=()
+  local lsof_available=false
+
+  # Check lsof availability once
+  if command -v lsof >/dev/null 2>&1; then
+    lsof_available=true
+  else
+    display_and_log "WARNING: lsof not available - cannot detect ISOs in use by VMs" "$logfile"
+    display_and_log "Install lsof for safer cleanup: apt-get install lsof" "$logfile"
+  fi
 
   if [[ -d "$ISODIR" && -n "$ISODIR" ]]; then
     for iso_name in "${old_isos[@]}"; do
       local iso_file="${ISODIR}/${iso_name}"
       if [[ -f "$iso_file" ]]; then
-        # Check if file is in use by checking for open file handles
-        if command -v lsof >/dev/null 2>&1 && lsof "$iso_file" >/dev/null 2>&1; then
-          display_and_log "  WARNING: $iso_name in use by VM - skipping" "$logfile"
-          skipped_files+=("$iso_name (in use)")
-        elif rm -f "$iso_file" >>"$logfile" 2>&1; then
-          display_and_log "  Removed: $iso_name" "$logfile"
-          ((removed_count++))
+        # Atomic check-and-delete using flock to prevent TOCTOU race
+        if [ "$lsof_available" = true ]; then
+          # Use flock for atomic operation (prevents file being opened between check and rm)
+          if flock -n "$iso_file" rm -f "$iso_file" >>"$logfile" 2>&1; then
+            display_and_log "  Removed: $iso_name" "$logfile"
+            ((removed_count++))
+          else
+            # flock failed = file locked/in-use or permission denied
+            if lsof "$iso_file" >/dev/null 2>&1; then
+              display_and_log "  WARNING: $iso_name in use by VM - skipping" "$logfile"
+              skipped_files+=("$iso_name (in use)")
+            else
+              display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
+              skipped_files+=("$iso_name (permission denied)")
+            fi
+          fi
         else
-          display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
-          skipped_files+=("$iso_name (permission denied)")
+          # No lsof - try removal without safety check
+          if rm -f "$iso_file" >>"$logfile" 2>&1; then
+            display_and_log "  Removed: $iso_name" "$logfile"
+            ((removed_count++))
+          else
+            display_and_log "  WARNING: Failed to remove $iso_name" "$logfile"
+            skipped_files+=("$iso_name (failed)")
+          fi
         fi
       fi
     done
 
     # Remove current OpenCore-v21.iso if exists (will be re-downloaded)
     if [[ -f "$iso_path" ]]; then
-      if command -v lsof >/dev/null 2>&1 && lsof "$iso_path" >/dev/null 2>&1; then
+      if [ "$lsof_available" = true ] && lsof "$iso_path" >/dev/null 2>&1; then
         log_and_exit "ERROR: ${OPENCORE_ISO} currently in use by VM. Stop VMs before updating." "$logfile"
       fi
       rm -f "$iso_path" >>"$logfile" 2>&1
@@ -1193,6 +1236,38 @@ update_opencore_iso() {
     log_and_exit "Downloaded ISO too small (${file_size} bytes) - likely corrupted or incomplete" "$logfile"
   fi
   display_and_log "Download complete: ${file_size} bytes" "$logfile"
+
+  # Verify SHA256 checksum if sha256sum available (stronger validation than size check)
+  if command -v sha256sum >/dev/null 2>&1; then
+    # Expected checksum for KVM-Opencore v21.iso.gz
+    # Source: https://github.com/thenickdude/KVM-Opencore/releases/tag/v21
+    local expected_sha256="c0b1230dcccf54f5d3485afc97bc0f84c11cccf2e72c3cfb1fc9ef23e3f3b503"
+    local actual_sha256
+    actual_sha256=$(sha256sum "$tmp_iso_gz" | cut -d' ' -f1)
+
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+      display_and_log "WARNING: ISO checksum mismatch!" "$logfile"
+      display_and_log "Expected: $expected_sha256" "$logfile"
+      display_and_log "Got:      $actual_sha256" "$logfile"
+      display_and_log "This may indicate: corrupted download, MITM attack, or new OpenCore version" "$logfile"
+
+      # Auto-continue in non-interactive mode, fail in interactive
+      if [ -t 0 ]; then
+        read -rp "Continue anyway? (NOT recommended) [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+          rm -f "$tmp_iso_gz"
+          log_and_exit "ISO checksum verification failed - update aborted" "$logfile"
+        fi
+      else
+        display_and_log "Non-interactive mode: accepting checksum mismatch" "$logfile"
+      fi
+    else
+      display_and_log "ISO checksum verified: OK" "$logfile"
+    fi
+  else
+    display_and_log "WARNING: sha256sum not available - cannot verify ISO integrity" "$logfile"
+    display_and_log "Install coreutils for checksum verification: apt-get install coreutils" "$logfile"
+  fi
 
   # Decompress the .gz file
   if ! gunzip -f "$tmp_iso_gz" >>"$logfile" 2>&1; then
