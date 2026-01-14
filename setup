@@ -754,11 +754,26 @@ download_recovery_image() {
   check_sequoia_requirements "$version_name" "$logfile" || log_and_exit "Pre-flight checks failed" "$logfile"
 
   display_and_log "Creating recovery image for $version_name..." "$logfile"
+
+  # CRITICAL: Create GPT partition table with EFI System Partition for OpenCore compatibility
+  # OpenCore cannot detect raw FAT32 filesystems - requires proper GPT + EFI partition
   fallocate -x -l "$iso_size" "${TMPDIR}/recovery-${version_name,,}.iso" >>"$logfile" 2>&1 || log_and_exit "Failed to allocate image" "$logfile"
-  mkfs.msdos -F 32 "${TMPDIR}/recovery-${version_name,,}.iso" -n "${version_name^^}" >>"$logfile" 2>&1 || log_and_exit "Failed to format image" "$logfile"
+
   local loopdev=$(losetup -f --show "${TMPDIR}/recovery-${version_name,,}.iso") || log_and_exit "Failed to set up loop device" "$logfile"
+
+  # Create GPT partition table with EFI System Partition
+  sgdisk -Z "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to wipe partition table" "$logfile"
+  sgdisk -n 1:0:0 -t 1:EF00 -c 1:"EFI System" "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to create EFI partition" "$logfile"
+
+  # Force kernel to reread partitions
+  partprobe "$loopdev" >>"$logfile" 2>&1
+  sleep 2
+
+  # Format EFI partition as FAT32
+  mkfs.vfat -F 32 -n "${version_name^^}" "${loopdev}p1" >>"$logfile" 2>&1 || log_and_exit "Failed to format EFI partition" "$logfile"
+
   mkdir -p /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
-  mount "$loopdev" /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to mount image" "$logfile"
+  mount "${loopdev}p1" /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to mount EFI partition" "$logfile"
   cd /mnt/APPLE
 
   # Validate board_id and model_id to prevent command injection
