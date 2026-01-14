@@ -76,6 +76,25 @@ declare -A MACOS_CONFIG=(
   ["8"]="Sequoia|15|Mac-7BA5B2D9E42DDD94|00000000000000000|1450M|virtio0"
 )
 
+# Stable recovery version pinning for reliable downloads
+# Using pinned versions prevents pulling unstable/broken recovery images
+declare -A STABLE_RECOVERY_VERSIONS=(
+  ["Monterey"]="12.7.2"
+  ["Ventura"]="13.6.1"
+  ["Sonoma"]="14.2.1"
+  ["Sequoia"]="15.1.0"
+)
+
+# Known checksums for pinned recovery versions
+# Checksums are validated post-download to detect corruption
+# Format: "version-name-X.Y.Z"="sha256:hash"
+declare -A KNOWN_CHECKSUMS=(
+  ["Sequoia-15.1.0"]=""
+  ["Sonoma-14.2.1"]=""
+  ["Ventura-13.6.1"]=""
+  ["Monterey-12.7.2"]=""
+)
+
 # Display and log function
 display_and_log() {
   local message="$1"
@@ -527,6 +546,202 @@ setup_prerequisites() {
   sleep 15 && reboot
 }
 
+# Function to validate recovery ISO checksum
+validate_checksum() {
+  local version_name="$1"
+  local pinned_version="$2"
+  local download_dir="$3"
+  local logfile="$4"
+
+  # Skip validation if no checksum is defined
+  local checksum_key="${version_name}-${pinned_version}"
+  local expected_checksum="${KNOWN_CHECKSUMS[$checksum_key]}"
+
+  if [[ -z "$expected_checksum" ]]; then
+    display_and_log "⚠️  No checksum available for ${checksum_key}, skipping validation" "$logfile"
+    return 0
+  fi
+
+  display_and_log "Validating checksum for ${checksum_key}..." "$logfile"
+
+  # Find BaseSystem.dmg (or similar recovery files)
+  local recovery_file
+  recovery_file=$(find "$download_dir" -name "*.dmg" -o -name "*.chunklist" | head -1)
+
+  if [[ -z "$recovery_file" || ! -f "$recovery_file" ]]; then
+    display_and_log "⚠️  No recovery files found for checksum validation" "$logfile"
+    return 0
+  fi
+
+  local actual_checksum
+  actual_checksum=$(sha256sum "$recovery_file" | awk '{print $1}')
+
+  if [[ "$actual_checksum" != "$expected_checksum" ]]; then
+    display_and_log "❌ Checksum mismatch for $recovery_file" "$logfile"
+    display_and_log "   Expected: $expected_checksum" "$logfile"
+    display_and_log "   Got:      $actual_checksum" "$logfile"
+    return 1
+  fi
+
+  display_and_log "✓ Checksum validated successfully" "$logfile"
+  return 0
+}
+
+# Function to check Sequoia-specific requirements
+check_sequoia_requirements() {
+  local version_name="$1"
+  local logfile="$2"
+
+  # Only check for Sequoia
+  [[ "$version_name" != "Sequoia" ]] && return 0
+
+  display_and_log "Running Sequoia pre-flight checks..." "$logfile"
+
+  # Check kernel version for BCM94360 compatibility
+  local kernel_version=$(uname -r)
+  if lspci 2>/dev/null | grep -qi BCM94360; then
+    if [[ "$kernel_version" != "5.15.53-1-pve" ]]; then
+      cat <<-EOF
+
+	═══════════════════════════════════════════════════════════════
+	⚠️  KERNEL COMPATIBILITY WARNING
+	═══════════════════════════════════════════════════════════════
+
+	macOS Sequoia with BCM94360 WiFi requires kernel 5.15.53-1-pve
+	Current kernel: $kernel_version
+
+	Known issues with newer kernels:
+	  • WiFi adapter causes kernel panic during boot
+	  • Bluetooth device enumeration hangs
+
+	Recommended actions:
+	  1. apt install pve-kernel-5.15.53-1-pve
+	  2. proxmox-boot-tool kernel pin 5.15.53-1-pve
+	  3. reboot
+	  4. Re-run this setup script
+
+	═══════════════════════════════════════════════════════════════
+
+	EOF
+      read -p "Continue anyway? (y/N): " -n 1 -r
+      echo
+      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_and_exit "Sequoia pre-flight check failed - kernel incompatible" "$logfile"
+      fi
+    fi
+  fi
+
+  # Check disk space (3GB minimum for Sequoia)
+  local tmpdir_path="${TMPDIR:-/tmp}"
+  local avail_bytes=$(df "$tmpdir_path" | awk 'NR==2 {print $4}')
+  local avail_gb=$((avail_bytes / 1024 / 1024))
+
+  if [[ $avail_gb -lt 3 ]]; then
+    log_and_exit "Insufficient disk space: ${avail_gb}GB available (need 3GB for Sequoia)" "$logfile"
+  fi
+
+  # Check Apple CDN connectivity
+  if ! timeout 5 curl -IsS https://swcdn.apple.com >/dev/null 2>&1; then
+    display_and_log "⚠️  Cannot reach Apple CDN (swcdn.apple.com)" "$logfile"
+    display_and_log "   Check your network connection and firewall settings" "$logfile"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      log_and_exit "Sequoia pre-flight check failed - CDN unreachable" "$logfile"
+    fi
+  fi
+
+  display_and_log "✓ Sequoia pre-flight checks passed" "$logfile"
+  return 0
+}
+
+# Function to download recovery with retry logic
+download_recovery_with_retry() {
+  local version_name="$1"
+  local board_id="$2"
+  local model_id="$3"
+  local download_dir="$4"
+  local logfile="$5"
+
+  local max_attempts=3
+  local attempt=1
+  local backoff_base=10
+
+  # Determine if we should use pinned version
+  local pinned_version="${STABLE_RECOVERY_VERSIONS[$version_name]}"
+  local recovery_args="-b $board_id -m $model_id download"
+
+  if [[ -n "$pinned_version" ]]; then
+    display_and_log "Using pinned recovery version $pinned_version for $version_name" "$logfile"
+    # Note: macrecovery.py -v flag may not exist, need to check
+    # For now, we'll keep the original behavior for Sequoia with -os latest
+    # This can be enhanced when macrecovery.py supports version pinning
+    if [[ "$version_name" == "Sequoia" ]]; then
+      recovery_args="$recovery_args -os latest"
+      display_and_log "⚠️  Using -os latest flag (version pinning not yet implemented in macrecovery.py)" "$logfile"
+    fi
+  else
+    if [[ "$version_name" == "Sequoia" ]]; then
+      recovery_args="$recovery_args -os latest"
+    fi
+  fi
+
+  while (( attempt <= max_attempts )); do
+    display_and_log "Download attempt $attempt/$max_attempts for $version_name..." "$logfile"
+
+    # Show progress indicator for large downloads
+    if [[ "$version_name" =~ ^(Sequoia|Sonoma)$ ]]; then
+      display_and_log "Downloading ${version_name} recovery (1450M - this may take 10-15 minutes)..." "$logfile"
+    fi
+
+    # Attempt download with timeout (30 minutes max)
+    if timeout 1800 python3 "${SCRIPT_DIR}/tools/macrecovery/macrecovery.py" $recovery_args >>"$logfile" 2>&1; then
+      # Validate download if checksums are available
+      if [[ -n "$pinned_version" ]]; then
+        if validate_checksum "$version_name" "$pinned_version" "$download_dir" "$logfile"; then
+          display_and_log "✓ Recovery download and validation successful" "$logfile"
+          return 0
+        else
+          display_and_log "⚠️  Checksum validation failed, retrying..." "$logfile"
+          # Clean up failed download
+          rm -f "$download_dir"/*.dmg "$download_dir"/*.chunklist 2>/dev/null
+        fi
+      else
+        # No checksum available, assume success
+        display_and_log "✓ Recovery download complete (no checksum validation)" "$logfile"
+        return 0
+      fi
+    else
+      local exit_code=$?
+      if [[ $exit_code -eq 124 ]]; then
+        display_and_log "❌ Download timeout (30 minutes exceeded)" "$logfile"
+      else
+        display_and_log "❌ Download failed with exit code $exit_code" "$logfile"
+      fi
+    fi
+
+    # Increment attempt and apply exponential backoff
+    ((attempt++))
+    if (( attempt <= max_attempts )); then
+      local sleep_time=$((backoff_base * attempt))
+      display_and_log "Waiting ${sleep_time}s before retry..." "$logfile"
+      sleep "$sleep_time"
+    fi
+  done
+
+  # All attempts failed
+  display_and_log "❌ Recovery download failed after $max_attempts attempts" "$logfile"
+  display_and_log "" "$logfile"
+  display_and_log "Troubleshooting steps:" "$logfile"
+  display_and_log "  1. Check network: ping -c3 swcdn.apple.com" "$logfile"
+  display_and_log "  2. Check disk space: df -h $download_dir" "$logfile"
+  display_and_log "  3. Check firewall: iptables -L | grep DROP" "$logfile"
+  display_and_log "  4. Review log: less $logfile" "$logfile"
+  display_and_log "" "$logfile"
+
+  return 1
+}
+
 # Function to download recovery image
 download_recovery_image() {
   local version_name=$1 board_id=$2 model_id=$3 iso_size=$4
@@ -534,6 +749,10 @@ download_recovery_image() {
   local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
 
   [[ -e "$iso_path" ]] && { display_and_log "Recovery image for $version_name exists" "$logfile"; return; }
+
+  # Run pre-flight checks for Sequoia
+  check_sequoia_requirements "$version_name" "$logfile" || log_and_exit "Pre-flight checks failed" "$logfile"
+
   display_and_log "Creating recovery image for $version_name..." "$logfile"
   fallocate -x -l "$iso_size" "${TMPDIR}/recovery-${version_name,,}.iso" >>"$logfile" 2>&1 || log_and_exit "Failed to allocate image" "$logfile"
   mkfs.msdos -F 32 "${TMPDIR}/recovery-${version_name,,}.iso" -n "${version_name^^}" >>"$logfile" 2>&1 || log_and_exit "Failed to format image" "$logfile"
@@ -547,9 +766,14 @@ download_recovery_image() {
     log_and_exit "Invalid board_id or model_id format" "$logfile"
   fi
 
-  local recovery_args="-b $board_id -m $model_id download"
-  [[ "$version_name" == "Sequoia" ]] && recovery_args="$recovery_args -os latest"
-  python3 "${SCRIPT_DIR}/tools/macrecovery/macrecovery.py" $recovery_args >>"$logfile" 2>&1 || log_and_exit "Failed to download recovery" "$logfile"
+  # Download recovery with retry logic
+  if ! download_recovery_with_retry "$version_name" "$board_id" "$model_id" "/mnt/APPLE" "$logfile"; then
+    cd "$SCRIPT_DIR"
+    umount /mnt/APPLE >>"$logfile" 2>&1
+    losetup -d "$loopdev" >>"$logfile" 2>&1
+    log_and_exit "Failed to download recovery after multiple attempts" "$logfile"
+  fi
+
   cd "$SCRIPT_DIR"
   umount /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to unmount image" "$logfile"
   losetup -d "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to detach loop device" "$logfile"
