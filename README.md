@@ -25,7 +25,12 @@ Run macOS on Proxmox VE (AMD & Intel) with automatic version detection and compa
 
 ## What's New
 
-### Latest Updates (December 2024)
+### Latest Updates (January 2026)
+- **Sequoia Stability Improvements** - Pinned recovery versions, retry logic, checksum validation
+- **Pre-flight Checks** - BCM94360 kernel compatibility, disk space, CDN connectivity
+- **Enhanced Error Handling** - 3-attempt retry with exponential backoff, detailed troubleshooting guidance
+
+### Previous Updates (December 2024)
 - **Interactive Menu Navigation** - Arrow key selection for all VM options (CPU/RAM/Disk/Storage/Bridge)
 - **Security Hardening** - Fixed 5 critical vulnerabilities (command injection, path traversal, network timeouts)
 - **Better Error Handling** - ISO validation prevents broken VMs, automatic rollback on failures
@@ -489,6 +494,74 @@ See [Performance Optimization](#-performance-optimization) section below
 ---
 
 ## Troubleshooting
+
+### ❌ Sequoia Recovery Download Fails
+
+**Symptoms:**
+- "Failed to download recovery" error
+- Download times out or hangs
+- Checksum validation fails
+
+**Causes:**
+1. Network connectivity issues to Apple CDN (swcdn.apple.com)
+2. Insufficient disk space (<3GB)
+3. BCM94360 WiFi hardware conflict
+4. Firewall blocking Apple servers
+
+**Automatic Fixes Applied:**
+- Script now retries download 3 times with exponential backoff (10s, 20s, 40s)
+- Pre-flight checks validate disk space, CDN connectivity, kernel compatibility
+- Progress indicators for large downloads (1450M)
+
+**Manual Troubleshooting:**
+
+**Check 1: Network Connectivity**
+```bash
+# Test Apple CDN
+ping -c3 swcdn.apple.com
+curl -I https://swcdn.apple.com
+
+# Check firewall
+iptables -L | grep DROP
+```
+
+**Check 2: Disk Space**
+```bash
+# Verify 3GB+ available in /tmp
+df -h /tmp
+```
+
+**Check 3: BCM94360 Kernel Compatibility (Sequoia only)**
+```bash
+# Check current kernel
+uname -r
+
+# If you have BCM94360 WiFi and kernel != 5.15.53-1-pve:
+apt install pve-kernel-5.15.53-1-pve
+proxmox-boot-tool kernel pin 5.15.53-1-pve
+reboot
+```
+
+**Check 4: Review Logs**
+```bash
+# View detailed download logs
+ls -lh /var/log/proxmox-osx-generator/crt-recovery-sequoia.log
+less /var/log/proxmox-osx-generator/crt-recovery-sequoia.log
+```
+
+**Manual Download (Last Resort):**
+If automated retry fails, download manually on another machine and transfer:
+```bash
+# On Mac/Linux with internet:
+git clone https://github.com/acidanthera/OpenCorePkg
+cd OpenCorePkg/Utilities/macrecovery
+python3 macrecovery.py -b Mac-7BA5B2D9E42DDD94 -m 00000000000000000 -os latest download
+
+# Transfer BaseSystem.dmg and BaseSystem.chunklist to Proxmox
+# Place in /mnt/APPLE/ directory during setup
+```
+
+---
 
 ### ❌ VM Won't Boot Past Apple Logo (Proxmox 9.x)
 
