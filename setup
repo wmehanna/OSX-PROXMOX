@@ -861,7 +861,8 @@ create_vm() {
   fi
 
   # Attach imported OpenCore disk to ide0 and remove from unused
-  qm set "$vm_id" -ide0 "$disk_path,cache=unsafe" >>"$logfile" 2>&1 || log_and_exit "Failed to attach OpenCore disk" "$logfile"
+  # CRITICAL: media=disk required for QEMU 10.x - OpenCore cannot boot from media=cdrom
+  qm set "$vm_id" -ide0 "$disk_path,cache=unsafe,media=disk" >>"$logfile" 2>&1 || log_and_exit "Failed to attach OpenCore disk" "$logfile"
   qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
 
   # CRITICAL: Import Recovery ISO as a disk image for OpenCore compatibility
@@ -880,7 +881,8 @@ create_vm() {
   fi
 
   # Attach imported Recovery disk to ide2 and remove from unused
-  qm set "$vm_id" -ide2 "$disk_path,cache=unsafe" >>"$logfile" 2>&1 || log_and_exit "Failed to attach Recovery disk" "$logfile"
+  # CRITICAL: media=disk required for QEMU 10.x - OpenCore cannot detect media=cdrom ISOs
+  qm set "$vm_id" -ide2 "$disk_path,cache=unsafe,media=disk" >>"$logfile" 2>&1 || log_and_exit "Failed to attach Recovery disk" "$logfile"
   qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
 
   echo -e "${COLOR_GREEN}✓ VM ($vm_name) created successfully${COLOR_RESET}"
