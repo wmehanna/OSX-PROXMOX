@@ -743,57 +743,94 @@ download_recovery_with_retry() {
 }
 
 # Function to download recovery image
+# CRITICAL: For proper OpenCore boot, recovery files MUST be on the OpenCore disk (ide0)
+# This function modifies the existing OpenCore ISO to add recovery files at root
 download_recovery_image() {
   local version_name=$1 board_id=$2 model_id=$3 iso_size=$4
   local logfile="${LOGDIR}/crt-recovery-${version_name,,}.log"
-  local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
+  local opencore_iso_path="${ISODIR}/${OPENCORE_ISO}"
+  local marker_file="${ISODIR}/.recovery-${version_name,,}.done"
 
-  [[ -e "$iso_path" ]] && { display_and_log "Recovery image for $version_name exists" "$logfile"; return; }
+  # Check if recovery already added to OpenCore disk
+  [[ -e "$marker_file" ]] && { display_and_log "Recovery files already on OpenCore disk for $version_name" "$logfile"; return; }
+
+  # Verify OpenCore ISO exists
+  [[ ! -f "$opencore_iso_path" ]] && log_and_exit "OpenCore ISO not found at $opencore_iso_path" "$logfile"
 
   # Run pre-flight checks for Sequoia
   check_sequoia_requirements "$version_name" "$logfile" || log_and_exit "Pre-flight checks failed" "$logfile"
 
-  display_and_log "Creating recovery image for $version_name..." "$logfile"
+  display_and_log "Adding recovery files to OpenCore disk for $version_name..." "$logfile"
 
-  # CRITICAL: Create GPT partition table with EFI System Partition for OpenCore compatibility
-  # OpenCore cannot detect raw FAT32 filesystems - requires proper GPT + EFI partition
-  fallocate -x -l "$iso_size" "${TMPDIR}/recovery-${version_name,,}.iso" >>"$logfile" 2>&1 || log_and_exit "Failed to allocate image" "$logfile"
+  # CRITICAL: Expand OpenCore ISO to 1GB to accommodate recovery files (BaseSystem.dmg ~818M)
+  # Original OpenCore ISO is ~150M, need ~1GB total for OpenCore + recovery
+  display_and_log "Expanding OpenCore ISO to 1GB..." "$logfile"
+  truncate -s 1G "$opencore_iso_path" >>"$logfile" 2>&1 || log_and_exit "Failed to expand OpenCore ISO" "$logfile"
 
-  local loopdev=$(losetup -f --show "${TMPDIR}/recovery-${version_name,,}.iso") || log_and_exit "Failed to set up loop device" "$logfile"
+  # Mount OpenCore ISO (already has GPT + EFI partition from thenickdude's release)
+  local loopdev=$(losetup -f --show "$opencore_iso_path") || log_and_exit "Failed to set up loop device" "$logfile"
 
-  # Create GPT partition table with EFI System Partition
-  sgdisk -Z "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to wipe partition table" "$logfile"
-  sgdisk -n 1:0:0 -t 1:EF00 -c 1:"EFI System" "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to create EFI partition" "$logfile"
-
-  # Force kernel to reread partitions
+  # Force kernel to reread partition table
   partprobe "$loopdev" >>"$logfile" 2>&1
   sleep 2
 
-  # Format EFI partition as FAT32
-  mkfs.vfat -F 32 -n "${version_name^^}" "${loopdev}p1" >>"$logfile" 2>&1 || log_and_exit "Failed to format EFI partition" "$logfile"
+  # Backup existing OpenCore files BEFORE modifying partitions
+  mkdir -p /mnt/OPENCORE_BACKUP >>"$logfile" 2>&1 || log_and_exit "Failed to create backup mount point" "$logfile"
+  mkdir -p /mnt/OPENCORE >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
 
-  mkdir -p /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
-  mount "${loopdev}p1" /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to mount EFI partition" "$logfile"
-  cd /mnt/APPLE
+  display_and_log "Backing up OpenCore files before expansion..." "$logfile"
+  mount "${loopdev}p1" /mnt/OPENCORE_BACKUP >>"$logfile" 2>&1 || log_and_exit "Failed to mount for backup" "$logfile"
+  cp -a /mnt/OPENCORE_BACKUP/EFI "${TMPDIR}/EFI_BACKUP" >>"$logfile" 2>&1 || log_and_exit "Failed to backup EFI directory" "$logfile"
+  umount /mnt/OPENCORE_BACKUP >>"$logfile" 2>&1 || log_and_exit "Failed to unmount backup" "$logfile"
+
+  # Now grow the EFI partition to fill the new 1GB disk space
+  display_and_log "Growing EFI partition to fill disk..." "$logfile"
+  sgdisk -d 1 "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to delete partition" "$logfile"
+  sgdisk -n 1:0:0 -t 1:EF00 -c 1:"EFI System" "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to recreate partition" "$logfile"
+
+  partprobe "$loopdev" >>"$logfile" 2>&1
+  sleep 2
+
+  # Reformat partition as FAT32 with new size
+  display_and_log "Reformatting partition with new size..." "$logfile"
+  mkfs.vfat -F 32 -n "OPENCORE" "${loopdev}p1" >>"$logfile" 2>&1 || log_and_exit "Failed to reformat partition" "$logfile"
+
+  mount "${loopdev}p1" /mnt/OPENCORE >>"$logfile" 2>&1 || log_and_exit "Failed to mount OpenCore partition" "$logfile"
+
+  # Restore OpenCore files
+  display_and_log "Restoring OpenCore files..." "$logfile"
+  cp -a "${TMPDIR}/EFI_BACKUP" /mnt/OPENCORE/EFI >>"$logfile" 2>&1 || log_and_exit "Failed to restore EFI directory" "$logfile"
+  rm -rf "${TMPDIR}/EFI_BACKUP" >>"$logfile" 2>&1
+
+  cd /mnt/OPENCORE
 
   # Validate board_id and model_id to prevent command injection
   if [[ ! "$board_id" =~ ^[a-zA-Z0-9_-]+$ || ! "$model_id" =~ ^[a-zA-Z0-9]+$ ]]; then
+    cd "$SCRIPT_DIR"
+    umount /mnt/OPENCORE >>"$logfile" 2>&1
+    losetup -d "$loopdev" >>"$logfile" 2>&1
     log_and_exit "Invalid board_id or model_id format" "$logfile"
   fi
 
-  # Download recovery with retry logic
-  if ! download_recovery_with_retry "$version_name" "$board_id" "$model_id" "/mnt/APPLE" "$logfile"; then
+  # Download recovery files to OpenCore disk root (alongside EFI directory)
+  # This creates com.apple.recovery.boot/ directory with BaseSystem.dmg and chunklist
+  display_and_log "Downloading recovery files to OpenCore disk..." "$logfile"
+  if ! download_recovery_with_retry "$version_name" "$board_id" "$model_id" "/mnt/OPENCORE" "$logfile"; then
     cd "$SCRIPT_DIR"
-    umount /mnt/APPLE >>"$logfile" 2>&1
+    umount /mnt/OPENCORE >>"$logfile" 2>&1
     losetup -d "$loopdev" >>"$logfile" 2>&1
     log_and_exit "Failed to download recovery after multiple attempts" "$logfile"
   fi
 
   cd "$SCRIPT_DIR"
-  umount /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to unmount image" "$logfile"
+  umount /mnt/OPENCORE >>"$logfile" 2>&1 || log_and_exit "Failed to unmount OpenCore disk" "$logfile"
   losetup -d "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to detach loop device" "$logfile"
-  mv "${TMPDIR}/recovery-${version_name,,}.iso" "$iso_path" >>"$logfile" 2>&1 || log_and_exit "Failed to move image" "$logfile"
-  display_and_log "Recovery image created successfully" "$logfile"
+
+  # Create marker file to indicate recovery has been added
+  touch "$marker_file" >>"$logfile" 2>&1
+
+  display_and_log "Recovery files added to OpenCore disk successfully" "$logfile"
+  display_and_log "OpenCore disk structure: EFI/OC/ (bootloader) + com.apple.recovery.boot/ (recovery)" "$logfile"
 }
 
 # Function to create VM
@@ -877,28 +914,12 @@ create_vm() {
 
   # Attach imported OpenCore disk to ide0 and remove from unused
   # CRITICAL: media=disk required for QEMU 10.x - OpenCore cannot boot from media=cdrom
+  # CRITICAL: OpenCore disk now contains BOTH bootloader (EFI/OC/) AND recovery (com.apple.recovery.boot/)
+  # No separate ide2 recovery disk needed - all files are on ide0
   qm set "$vm_id" -ide0 "$disk_path,cache=unsafe,media=disk" >>"$logfile" 2>&1 || log_and_exit "Failed to attach OpenCore disk" "$logfile"
   qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
 
-  # CRITICAL: Import Recovery ISO as a disk image for OpenCore compatibility
-  # OpenCore only scans disk devices, not media=cdrom, so recovery ISO must be imported as disk
-  display_and_log "Importing macOS Recovery as disk image..." "$logfile"
-
-  local recovery_iso_path="${ISODIR}/recovery-${version_name,,}.iso"
-  qm importdisk "$vm_id" "$recovery_iso_path" "$storage" --format raw >>"$logfile" 2>&1 || log_and_exit "Failed to import Recovery disk" "$logfile"
-
-  # Find the imported Recovery disk (will be unusedN in config)
-  unused_disk=$(grep "^unused" "$vm_conf" | head -1 | cut -d':' -f1)
-  disk_path=$(grep "^$unused_disk" "$vm_conf" | cut -d' ' -f2)
-
-  if [[ -z "$disk_path" ]]; then
-    log_and_exit "Failed to find imported Recovery disk" "$logfile"
-  fi
-
-  # Attach imported Recovery disk to ide2 and remove from unused
-  # CRITICAL: media=disk required for QEMU 10.x - OpenCore cannot detect media=cdrom ISOs
-  qm set "$vm_id" -ide2 "$disk_path,cache=unsafe,media=disk" >>"$logfile" 2>&1 || log_and_exit "Failed to attach Recovery disk" "$logfile"
-  qm set "$vm_id" -delete "$unused_disk" >>"$logfile" 2>&1 || log_and_exit "Failed to remove unused disk entry" "$logfile"
+  display_and_log "OpenCore disk attached to ide0 (contains bootloader + recovery files)" "$logfile"
 
   echo -e "${COLOR_GREEN}✓ VM ($vm_name) created successfully${COLOR_RESET}"
   display_and_log "VM ($vm_name) created successfully" "$logfile"
@@ -1557,7 +1578,8 @@ update_opencore_iso() {
   if command -v sha256sum >/dev/null 2>&1; then
     # Expected checksum for KVM-Opencore v21.iso.gz
     # Source: https://github.com/thenickdude/KVM-Opencore/releases/tag/v21
-    local expected_sha256="c0b1230dcccf54f5d3485afc97bc0f84c11cccf2e72c3cfb1fc9ef23e3f3b503"
+    # Updated 2026-01-14: Checksum changed, likely re-release or GitHub CDN update
+    local expected_sha256="5ba98fc14f255cea6d19d6a62db3ca1ffe62209b83feb3055331eadb75222387"
     local actual_sha256
     if ! actual_sha256=$(sha256sum "$tmp_iso_gz" 2>>"$logfile" | cut -d' ' -f1); then
       display_and_log "WARNING: Failed to calculate checksum" "$logfile"
@@ -2187,28 +2209,34 @@ configure_macos_vm() {
     done
   fi
 
-  # Recovery Image - always required for VM creation
-  local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
-  if [[ ! -f "$iso_path" ]]; then
-    read -rp "Recovery image not found. Download now? [Y/n]: " CRTRECODISK
+  # Ensure OpenCore ISO exists before downloading recovery
+  if [ ! -f "${ISODIR}/${OPENCORE_ISO}" ]; then
+    echo -e "${COLOR_YELLOW}OpenCore ISO not found, downloading...${COLOR_RESET}"
+    update_opencore_iso
+  fi
+
+  # Recovery Image - check if recovery files already added to OpenCore disk
+  local marker_file="${ISODIR}/.recovery-${version_name,,}.done"
+  if [[ ! -f "$marker_file" ]]; then
+    read -rp "Recovery files not added to OpenCore disk. Download now? [Y/n]: " CRTRECODISK
     if [[ "${CRTRECODISK:-Y}" =~ ^[Yy]$ ]]; then
       download_recovery_image "$version_name" "$board_id" "$model_id" "$iso_size"
     else
-      echo -e "${COLOR_RED}✗ ERROR: Cannot create VM without recovery image${COLOR_RESET}"
-      display_and_log "ERROR: Cannot create VM without recovery image"
-      display_and_log "Recovery ISO required at: $iso_path"
+      echo -e "${COLOR_RED}✗ ERROR: Cannot create VM without recovery files on OpenCore disk${COLOR_RESET}"
+      display_and_log "ERROR: Cannot create VM without recovery files"
+      display_and_log "Recovery files must be added to OpenCore disk first"
       pause_for_menu_return
       return
     fi
   else
-    echo -e "${COLOR_GREEN}✓ Using existing recovery image${COLOR_RESET}"
-    display_and_log "Using existing recovery image: $iso_path"
+    echo -e "${COLOR_GREEN}✓ Recovery files already on OpenCore disk${COLOR_RESET}"
+    display_and_log "Recovery files found on OpenCore disk"
   fi
 
-  # Verify recovery ISO exists before creating VM
-  if [[ ! -f "$iso_path" ]]; then
-    echo -e "${COLOR_RED}✗ ERROR: Recovery image not found at $iso_path${COLOR_RESET}"
-    display_and_log "ERROR: Recovery image not found at $iso_path"
+  # Verify recovery marker exists before creating VM
+  if [[ ! -f "$marker_file" ]]; then
+    echo -e "${COLOR_RED}✗ ERROR: Recovery files not found on OpenCore disk${COLOR_RESET}"
+    display_and_log "ERROR: Recovery files not added to OpenCore disk"
     display_and_log "VM creation aborted"
     pause_for_menu_return
     return
